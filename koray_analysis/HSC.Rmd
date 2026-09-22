@@ -1,0 +1,124 @@
+---
+title: "hsc_bulk"
+author: "Koray Dogan Kaya"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  xlsx_file: "data/patient_bulk/share_maria_bulk_HSC_XY_homologues_Figure2a_20260827.xlsx"
+  xy_helper: "xy_dosage_cpm.R"
+  output_prefix: "results/hsc/xypair_dosage_HSC_weighted_CPM"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r run-xy-dosage-from-xlsx, fig.width=14, fig.height=8, warning=FALSE}
+# Input/output paths are configured in the YAML header.
+xlsx_file <- params$xlsx_file
+source(params$xy_helper)
+dat <- readxl::read_excel(
+  xlsx_file,
+  sheet = 1,
+  .name_repair = "unique"
+) |>
+  dplyr::select(dplyr::where(\(x) !all(is.na(x))))
+
+names(dat) <- trimws(names(dat))
+
+dat <- dat |>
+  dplyr::mutate(
+    sample_id = trimws(as.character(sample_id)),
+    group = trimws(as.character(group)),
+    Sex = trimws(as.character(Sex))
+  ) |>
+  dplyr::filter(!is.na(sample_id), nzchar(sample_id))
+
+if (anyDuplicated(dat$sample_id))
+  stop("sample_id must be unique.")
+
+required_meta <- c("sample_id", "group", "Sex")
+if (!all(required_meta %in% names(dat)))
+  stop("Required columns: ", paste(required_meta, collapse = ", "))
+
+all_pairs <- c(
+  RPS4Y1 = "RPS4X",
+  ZFY    = "ZFX",
+  USP9Y  = "USP9X",
+  DDX3Y  = "DDX3X",
+  UTY    = "KDM6A",
+  KDM5D  = "KDM5C",
+  EIF1AY = "EIF1AX"
+)
+
+# Keep only pairs for which both homologues are present.
+pairs <- all_pairs[
+  names(all_pairs) %in% names(dat) &
+    unname(all_pairs) %in% names(dat)
+]
+
+if (!length(pairs))
+  stop("No complete X/Y pairs were found in the XLSX file.")
+
+genes <- unique(c(names(pairs), unname(pairs)))
+
+dat <- dat |>
+  dplyr::mutate(
+    dplyr::across(
+      dplyr::all_of(genes),
+      \(x) suppressWarnings(as.numeric(x))
+    )
+  )
+datm<-dat |> dplyr::filter(Sex=="Male")
+sample_cpm <- datm |>
+  dplyr::select(sample_id, dplyr::all_of(genes)) |>
+  tibble::column_to_rownames("sample_id") |>
+  as.matrix()
+sample_cpm2<-2^sample_cpm-1
+nrow(sample_cpm)
+
+if (any(!is.finite(sample_cpm)) || any(sample_cpm < 0))
+  stop("Gene columns must contain finite, non-negative CPM values.")
+
+xy_result <- xy_dosage_cpm(
+  cpm = sample_cpm2,
+  gender = stats::setNames(datm$Sex, datm$sample_id),
+  group = stats::setNames(datm$group, datm$sample_id),
+  condition = NULL,
+  pairs = pairs,
+  reference_group = "CN-Male",
+  out_prefix = params$output_prefix,
+  group_label_size = 14,
+  width = 14,
+  height = 4
+)
+
+cat(
+  "Pairs used:\n",
+  paste(names(pairs), unname(pairs), sep = "/", collapse = "\n"),
+  "\n\nPairs omitted:\n",
+  paste(
+    setdiff(
+      paste(names(all_pairs), unname(all_pairs), sep = "/"),
+      paste(names(pairs), unname(pairs), sep = "/")
+    ),
+    collapse = "\n"
+  ),
+  "\n"
+)
+
+knitr::kable(
+  xy_result$metrics,
+  digits = 3,
+  caption = paste(
+    "X/Y homolog expression relative to the",
+    "CN-Male X-plus-Y total for each pair."
+  )
+)
+
+```
+
+```{r export-software-versions, include=FALSE}
+writeLines(capture.output(sessionInfo()),
+           file.path(dirname(params$output_prefix), "sessionInfo.txt"))
+```

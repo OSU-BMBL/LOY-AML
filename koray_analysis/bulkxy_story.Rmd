@@ -1,0 +1,1898 @@
+---
+title: "kallisto to edgeR: transcript and gene level quantification"
+author: "Koray Dogan Kaya"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    df_print: paged
+params:
+  root_path: "results/bulk"
+  kallisto_out: "data/bulk/kallisto"
+  tx2gene_file: "data/bulk/tx2gene2.tsv"
+  alignment_rate: "data/bulk/alignment_rates/alignment_rates.tsv"
+  pairs_root: "data/bulk"
+  ref: ""
+  output_dir: "analysis"
+  seed: 173
+---
+**Question:** Do the LOY-associated transcriptional changes observed in the cell-line model
+support the direction and biological interpretation of the patient-data
+findings described in the manuscript?
+
+**Background**
+The LOY-associated transcriptional changes in the KG-1a cell-line model support the direction of the patient-data findings regarding the downregulation of antigen presentation machinery and the upregulation of EZH2, but they do not fully support the broader biological interpretation of immune competence because the cell-line model lacks the immune microenvironment necessary to demonstrate the T-cell differentiation block observed in patients.
+
+
+The hidden setup chunk applies consistent knitr behavior while retaining warnings that can reveal identifier-mapping problems.
+
+```{r setup, include=FALSE}
+# Purpose: configure output locations; no analytical settings are changed.
+# Input: file paths in the YAML parameters above.
+# Output: the directory used by the existing figure and table exports.
+# Author: Koray Dogan Kaya.
+out_dir <- file.path(params$root_path, params$output_dir)
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+if (!dir.exists(out_dir)) stop("Cannot create output directory: ", out_dir)
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = TRUE,
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+The library chunk loads the packages required for quantification, differential expression, module analysis, clustering, visualization, and workbook export.
+
+```{r required-libraries}
+suppressPackageStartupMessages({
+  library(edgeR)
+  library(tximport)
+  library(ggplot2)
+  library(ggrepel)
+  library(limma)
+  library(apcluster)
+  library(pheatmap)
+  library(readr)
+  library(dplyr)
+  library(openxlsx)
+  library(msigdbr)
+  library(decoupleR)
+  library(dorothea)
+})
+```
+
+The alignment-summary chunk compares STAR and kallisto mapping yields for the selected WT and LOY samples and saves the resulting quality-control plot.
+
+```{r alignment-plot, fig.width=11, fig.height=5}
+d <- read.delim(file.path(params$alignment_rate), stringsAsFactors = FALSE)
+d$value <- as.numeric(sub("%", "", d$value, fixed = TRUE))
+lev <- unique(d$sample)
+wt_loy <- lev[c(14:16, 4:10)]
+w <- as.data.frame(tapply(d$value, list(d$sample, d$metric), identity), check.names = FALSE)[lev, , drop = FALSE]
+starp <- w$STAR_uniquely_mapped_pct + w$STAR_multi_loci_pct
+df <- data.frame(
+  sample   = factor(lev, levels = lev),
+  tot_m    = pmax(w$STAR_input_reads, w$kallisto_n_processed, na.rm = TRUE) / 1e6,
+  star_m   = w$STAR_input_reads     * starp / 100 / 1e6,
+  kal_m    = w$kallisto_n_processed * w$kallisto_p_pseudoaligned / 100 / 1e6,
+  star_pct = starp,
+  kal_pct  = w$kallisto_p_pseudoaligned
+)[match(wt_loy, lev), ]
+df$sample <- factor(df$sample, levels = wt_loy)
+ggplot(df, aes(sample)) +
+  geom_col(aes(y = tot_m), width = .82, fill = "#ededed", colour = "#cccccc", linewidth = .3) +
+  geom_col(aes(y = star_m, fill = "Genome"), width = .82) +
+  geom_col(aes(y = kal_m,  fill = "Transcriptome"), width = .82) +
+  geom_text(aes(y = star_m, label = sprintf("%.1f%%", star_pct)), vjust = -0.4, size = 2.8) +
+  geom_text(aes(y = kal_m,  label = sprintf("%.1f%%", kal_pct)),  vjust = -0.4, size = 2.8, colour = "white") +
+  scale_fill_manual(NULL, values = c(Genome = "black", Transcriptome = "#8a8a8a")) +
+  labs(x = NULL, y = "Aligned pairs (millions)",
+       title = "Per-sample alignment: genome (STAR) vs transcriptome (kallisto)") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid.major.x = element_blank(), legend.position = "top")
+ggsave(file.path(params$root_path, params$output_dir, "fig2_alignmentrate.pdf"), device = cairo_pdf)
+```
+
+<!-- annotate_rmd figure: source=alignment-plot-1.png | match=label-tokens -->
+
+
+**Genome and Transcriptome alignment rates across wild-type and LOY samples.** Overlaid bar plot comparing the number of aligned read pairs (in millions) and alignment percentages for genome-based (STAR, black) and transcriptome-based (kallisto, grey) quantification. Samples include wild-type (WT1–WT3) and LOY clones (LOY1–LOY3, LOY-C1, LOY-C2, LOY-C4, LOY-C5). The total height of each bar represents the maximum aligned reads per sample. Percentages indicate the proportion of reads successfully aligned or pseudoaligned. Alignment rates are highly consistent between methods, with kallisto pseudoalignment ranging from 86.3% to 89.4% and STAR alignment ranging from 88.1% to 98.6%. The high concordance between STAR and kallisto alignment metrics suggests that the transcriptome-level quantification is robust and suitable for downstream differential expression analysis. 
+
+
+
+The import chunk reads the transcript-to-gene annotation, locates each selected kallisto abundance file, and summarizes scaled transcript abundance to gene-level count-scale values.
+
+```{r import-data2, results='hide'}
+kallisto_dir <- params$kallisto_out
+t2g_file <- params$tx2gene_file
+tx2gene <- read.delim(t2g_file, header = TRUE, stringsAsFactors = FALSE)
+stopifnot(all(c("transcript_id", "gene_id", "symbol") %in% colnames(tx2gene)))
+gene_annot <- unique(tx2gene[, c("gene_id", "symbol")])
+rownames(gene_annot) <- gene_annot$gene_id
+tsv_files <- file.path(kallisto_dir, wt_loy, "abundance.tsv")
+names(tsv_files) <- wt_loy
+txi.gene <- tximport(files = tsv_files, type = "kallisto",
+                     tx2gene = tx2gene[, 1:2], countsFromAbundance = "scaledTPM")
+```
+
+The design chunk assigns the order of 10 samples to the two WT (3) and LOY groups (7), defines plot colors, and constructs the no-intercept design matrix used throughout the analysis.
+
+```{r group-palette-design, results='hide'}
+group <- setNames(factor(rep(c("WT", "LOY"), c(3, 7)), levels = c("WT", "LOY")), wt_loy)
+palloy <- c(WT = "black", LOY = "#CC79A7")
+design <- model.matrix(~ 0 + group)
+colnames(design) <- levels(group)
+rownames(design) <- names(group)
+```
+
+The normalization chunk filters weakly expressed genes, applies TMM normalization, calculates raw and log-transformed gene CPM matrices, and stores sample-level normalization factors.
+
+```{r DGEObject-formation-and-normalization, results='hide'}
+y.gene <- DGEList(counts = txi.gene$counts, group = group)
+keep.gene <- filterByExpr(y.gene, design = design)
+message(sum(keep.gene), " of ", length(keep.gene), " genes retained by filterByExpr().")
+y.gene <- y.gene[keep.gene, , keep.lib.sizes = FALSE]
+y.gene <- calcNormFactors(y.gene, method = "TMM")
+gene_cpm <- cpm(y.gene, log = FALSE, normalized.lib.sizes = TRUE)
+genemat <- log2(gene_cpm + 1)
+normalization_table <- data.frame(
+  sample = colnames(y.gene$counts),
+  group = as.character(group[colnames(y.gene$counts)]),
+  library_size = y.gene$samples$lib.size,
+  TMM_factor = y.gene$samples$norm.factors,
+  effective_library_size = y.gene$samples$lib.size * y.gene$samples$norm.factors,
+  row.names = NULL
+)
+```
+
+The PCA chunk summarizes the top 1,000 variable log2-CPM genes and displays the selected samples in an expanded two-dimensional principal-component view.
+
+```{r quick-pca}
+top <- head(order(apply(genemat, 1, var), decreasing = TRUE), 1000)
+pca <- prcomp(t(genemat[top,]))
+ve <- 100 * pca$sdev^2 / sum(pca$sdev^2)
+pcdf <- data.frame(
+  sample = rownames(pca$x),
+  group = factor(group[rownames(pca$x)], levels = levels(group)),
+  PC1 = pca$x[, 1],
+  PC2 = pca$x[, 2],
+  row.names = NULL
+)
+
+pcdf_plot <- pcdf %>%
+  group_by(group) %>%
+  mutate(
+    group_PC1 = mean(PC1, na.rm = TRUE),
+    group_PC2 = mean(PC2, na.rm = TRUE),
+    PC1_plot = group_PC1 + 3 * (PC1 - group_PC1),
+    PC2_plot = group_PC2 + 3 * (PC2 - group_PC2)
+  ) %>%
+  ungroup()
+
+ggplot(pcdf_plot, aes(PC1_plot, PC2_plot, colour = group, label = sample)) +
+  geom_point(size = 1) +
+  geom_text_repel(
+    aes(label = sample),
+    colour = "grey20",
+    size = 3,
+    box.padding = 0.3,
+    point.padding = 0.3,
+    max.overlaps = Inf,
+    min.segment.length = 0,
+    seed = 123,
+    show.legend = FALSE
+  ) +
+  scale_colour_manual(values = palloy, name = NULL) +
+  labs(x = sprintf("PC1 (%.1f%%)", ve[1]),
+       y = sprintf("PC2 (%.1f%%)", ve[2]),
+       title = "Sample (LOY & WT) PCA - top 1000 variable genes, log2-CPM") +
+  theme_minimal(base_size = 11)
+
+ggsave(file.path(params$root_path, params$output_dir, "fig3_PCA_WT_LOY.pdf"), device = cairo_pdf)
+```
+
+<!-- annotate_rmd figure: source=fig3_PCA_WT_LOY.pdf | match=explicit-output-template -->
+
+**Principal component analysis separates LOY and WT samples based on global gene expression profiles.** Principal component analysis (PCA) was performed on the top 1,000 most variable genes using log2-CPM normalized expression data. Samples are colored by genotype: black for cytogenetically normal, wild-type (WT), and pink for Loss of Y chromosome (LOY). The first principal component (PC1), accounting for 96.9% of the variance, cleanly segregates the three WT replicates from the LOY samples, which cluster into two distinct subgroups. This strong separation indicates that LOY status is the primary driver of global gene expression variation in this dataset. While the LOY samples separate clearly from WT, the presence of two distinct LOY clusters suggests additional heterogeneity within the LOY group that warrants further investigation.
+
+
+
+The Y-expression chunk compares per-gene group-average log2-CPM values for expressed chromosome-Y genes and saves the distribution plot.
+
+```{r boxplot Y genes, fig.width=8, fig.height=4}
+sel_genes <- intersect(unique(tx2gene$gene_id[tx2gene$Chr == "Y"]), rownames(gene_cpm))
+maty <- gene_cpm[sel_genes, , drop = FALSE]
+rownames(maty) <- gene_annot[sel_genes, "symbol"]
+ord <- levels(group)
+gm <- sapply(ord, function(g) rowMeans(maty[, group == g, drop = FALSE]))
+bx <- data.frame(expr = as.vector(log2(gm + 1)),
+                 group = factor(rep(ord, each = nrow(gm)), levels = ord))
+
+ggplot(bx, aes(group, expr, colour = group, fill = group)) +
+  geom_boxplot(outlier.shape = NA, width = 0.65, alpha = 0.6) +
+  geom_point(data = subset(bx, ave(expr, group,
+                FUN = function(v) v < quantile(v, .25) - 1.5 * IQR(v) |
+                                  v > quantile(v, .75) + 1.5 * IQR(v)) == 1),
+             position = position_jitter(width = 0.08), size = 0.6, show.legend = FALSE) +
+  scale_colour_manual(values = palloy, guide = "none") +
+  scale_fill_manual(values = palloy, guide = "none") +
+  labs(x = NULL, y = "Mean expression  log2(CPM+1)",
+       title = sprintf("Per-group mean expression (n=%d genes)", length(sel_genes))) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.major.x = element_blank())
+ggsave(file.path(params$root_path, params$output_dir, "fig4_meanExpressionPerGroupOnY.pdf"), device = cairo_pdf)
+```
+
+<!-- annotate_rmd figure: source=fig4_meanExpressionPerGroupOnY.pdf | match=explicit-output-template -->
+
+**Global downregulation of Y-chromosome gene expression in LOY samples.** Boxplots show the distribution mean expression levels for Y-chromosome genes (42), among expressed after global filtering, was compared between wild-type (WT) and LOY groups. The LOY group exhibited a marked reduction in the median and overall range of Y-gene expression compared to the WT group, with the LOY distribution shifted toward the lower limit of detection. The global reduction in Y-gene expression in the LOY group supports the successful modeling of Y-chromosome loss and provides a baseline for interpreting specific downstream transcriptional changes.
+
+The voom chunk estimates the RNA-seq mean-variance trend, saves its diagnostic plot, and fits the empirical-Bayes LOY-versus-WT contrast used for all gene-level results.
+
+```{r voom-fit, fig.width=6, fig.height=5}
+cont <- makeContrasts(LOY_vs_WT = LOY - WT, levels = design)
+v <- voom(y.gene, design, plot = TRUE)
+cairo_pdf(file.path(params$root_path, params$output_dir, "fig6_Voom_MeanVs_Variance.pdf"), width = 6, height = 5)
+v <- voom(y.gene, design, plot = TRUE)
+dev.off()
+fit <- eBayes(contrasts.fit(lmFit(v, design), cont))
+```
+
+<!-- annotate_rmd figure: source=fig6_Voom_MeanVs_Variance.pdf | match=explicit-output-template -->
+
+**voom diagnostic plot showing the mean-variance trend of RNA-seq counts used for LOY differential expression analysis.** The diagnostic plot displays the relationship between the mean expression level and the variability of gene counts prior to differential expression testing. The x-axis represents the log2-transformed count size (log2(count size + 0.5)), and the y-axis represents the square root of the standard deviation. Each black point corresponds to a single gene. The red curve indicates the fitted mean-variance trend estimated by the voom function, which assigns precision weights to each observation based on its expected variance. A clear negative trend is visible, where the square root of the standard deviation decreases as the log2-transformed count size increases, stabilizing at higher expression levels. This pattern confirms that the precision weights generated by the voom function appropriately model the heteroscedasticity of the data, which is a prerequisite for the subsequent linear modeling of the LOY versus wild-type contrast. This figure validates the statistical assumptions of the differential expression pipeline.
+
+
+The expression-distribution chunk visualizes the voom log2-CPM distributions across samples while retaining the WT and LOY color assignments.
+
+```{r qc-boxplot, fig.width=6.5, fig.height=4.5}
+bx <- data.frame(expr   = as.vector(v$E),
+                 sample = factor(rep(colnames(v$E), each = nrow(v$E)), levels = colnames(v$E)),
+                 group  = factor(rep(as.character(group), each = nrow(v$E)), levels = levels(group)))
+ggplot(bx, aes(sample, expr, fill = group, colour = group)) +
+  geom_boxplot(outlier.size = 0.3, alpha = 0.6, width = 0.7) +
+  scale_fill_manual(values = palloy) + scale_colour_manual(values = palloy, guide = "none") +
+  labs(x = NULL, y = "log2-CPM (voom)", title = "Per-sample expression distribution") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid.major.x = element_blank())
+ggsave(file.path(params$root_path, params$output_dir, "fig7_Expression_Distribution.pdf"), device = cairo_pdf)
+```
+
+<!-- annotate_rmd figure: source=fig7_Expression_Distribution.pdf | match=explicit-output-template -->
+
+
+**Per-sample expression distributions are comparable across WT and LOY samples.** Boxplots show the distribution of log2-CPM values for each sample, grouped by WT (n=3) and LOY (n=7). The y-axis represents log2-CPM values after voom transformation. The x-axis lists individual samples. The fill color indicates the group (WT in black, LOY in pink). The median and interquartile range are shown for each sample. No statistical tests were performed. The comparable expression distributions suggest that the normalization and voom weighting have been applied correctly, ensuring that subsequent comparisons of gene expression levels between LOY and WT samples are not driven by technical artifacts. This supports the reliability of the downstream differential expression analysis.
+
+
+The module-definition chunk records all curated and published signatures, resolves current symbols and aliases to tx2gene Ensembl identifiers, incorporates available X-Y pairs, and documents unavailable MSigDB sets without interrupting the analysis.
+
+```{r module-definitions-and-identifiers, results='hide'}
+module_info <- data.frame(
+  module_id = sprintf("M%02d", 1:11),
+  module = c(
+    "MHC class I antigen presentation",
+    "Immunoproteasome and peptide processing",
+    "Interferon signaling and innate immune sensing",
+    "NK ligands: missing-self and killing resistance",
+    "Chromatin: PRC2 / H3K27me3 axis",
+    "Cell cycle and proliferation",
+    "Differentiation state and stemness (LSC)",
+    "Apoptosis / BCL2 family",
+    "Metabolism: FAO / TCA / OXPHOS / glycolysis",
+    "X-Y paralog dosage and compensation",
+    "Other immune related"
+  ),
+  sheet = c(
+    "M01_MHC_I", "M02_Immunoproteasome", "M03_Interferon",
+    "M04_NK_ligands", "M05_PRC2_H3K27me3", "M06_Cell_cycle",
+    "M07_LSC", "M08_Apoptosis", "M09_Metabolism",
+    "M10_XY_dosage", "M11_Other_immune"
+  ),
+  expected = c(
+    "Down", "Not prespecified", "Mostly down; negative regulators may increase",
+    "MHC-I down; resistance genes may increase", "Mixed, evaluate subgroups",
+    "Not prespecified", "Stemness up; maturation down", "Not prespecified",
+    "Not prespecified", "Loss of Y dosage with possible X compensation",
+    "Not prespecified"
+  ),
+  stringsAsFactors = FALSE
+)
+
+module_row <- function(module_id, subgroup, symbols, expected_direction) {
+  data.frame(
+    module_id = module_id,
+    subgroup = subgroup,
+    requested_symbol = unique(symbols),
+    expected_direction = expected_direction,
+    stringsAsFactors = FALSE
+  )
+}
+
+module_definition <- do.call(rbind, list(
+  module_row("M01", "MHC-I presentation machinery",
+    c("HLA-A","HLA-B","HLA-C","HLA-E","HLA-F","HLA-G","B2M","TAP1","TAP2",
+      "TAPBP","TAPBPL","CALR","CANX","PDIA3","NLRC5","RFX5","RFXAP","RFXANK",
+      "NFYA","NFYB","NFYC","CREB1"), "Down"),
+
+  module_row("M02", "Immunoproteasome catalytic", c("PSMB8","PSMB9","PSMB10"), "Down"),
+  module_row("M02", "PA28 activators", c("PSME1","PSME2"), "Down"),
+  module_row("M02", "Constitutive proteasome contrast", c("PSMB5","PSMB6","PSMB7"), "Contrast"),
+  module_row("M02", "Aminopeptidases", c("ERAP1","ERAP2","LNPEP","NPEPPS"), "Down"),
+
+  module_row("M03", "Signaling", c("STAT1","STAT2","IRF1","IRF7","IRF9","JAK1","JAK2"), "Down"),
+  module_row("M03", "ISG output",
+    c("GBP1","GBP2","GBP4","MX1","MX2","OAS1","OAS2","OAS3","ISG15","IFIT1",
+      "IFIT3","IFI6","IFI44L","IFITM1","IFITM3"), "Down"),
+  module_row("M03", "DNA and RNA sensors",
+    c("CGAS","STING1","IFI16","DDX58","IFIH1","MAVS","ZBP1"), "Down"),
+  module_row("M03", "NF-kB cytokines and chemokines",
+    c("NFKB1","RELA","RELB","IL1B","IL6","TNF","CXCL9","CXCL10","CCL5"), "Down"),
+  module_row("M03", "Negative regulators", c("SOCS1","SOCS3","PTPN2","PTPN6"), "Up"),
+
+  module_row("M04", "Inhibitory MHC-I ligands", c("HLA-A","HLA-B","HLA-C","HLA-E"), "Down"),
+  module_row("M04", "NKG2D activating ligands",
+    c("MICA","MICB","ULBP1","ULBP2","ULBP3","RAET1E","RAET1G"), "Not prespecified"),
+  module_row("M04", "DNAM-1 ligands", c("PVR","NECTIN2"), "Not prespecified"),
+  module_row("M04", "NK-recruiting chemokines", c("CXCL10","CCL5","CX3CL1"), "Not prespecified"),
+  module_row("M04", "Granzyme and death resistance",
+    c("SERPINB9","SERPINB6","CFLAR","FAS","TNFRSF10A","TNFRSF10B","CASP8"), "Up"),
+
+  module_row("M05", "PRC2 core",
+    c("EZH2","EZH1","EED","SUZ12","JARID2","AEBP2","MTF2","PHF19","RBBP4","RBBP7"), "EZH2 expected up"),
+  module_row("M05", "H3K27me3 erasers", c("KDM6A","KDM6B","UTY"), "Lost or uncompensated"),
+  module_row("M05", "KDM5 H3K4me3 erasers", c("KDM5A","KDM5B","KDM5C","KDM5D"), "Not prespecified"),
+  module_row("M05", "PRC1", c("RING1","RNF2","BMI1","CBX2","CBX7","CBX8"), "Not prespecified"),
+  module_row("M05", "DNA methylation",
+    c("DNMT1","DNMT3A","DNMT3B","UHRF1","TET1","TET2","TET3"), "Writers expected down"),
+
+  module_row("M06", "G1-S", c("CCND1","CCND2","CCND3","CCNE1","CCNE2","CDK2","CDK4","CDK6","E2F1","E2F2","MYC"), "Not prespecified"),
+  module_row("M06", "S phase", c("PCNA","MCM2","MCM3","MCM4","MCM5","MCM6","MCM7","RRM1","RRM2","TYMS"), "Not prespecified"),
+  module_row("M06", "G2-M", c("CCNA2","CCNB1","CCNB2","CDK1","PLK1","AURKA","AURKB","BUB1","CDC20","TOP2A","MKI67","CENPA"), "Not prespecified"),
+  module_row("M06", "CDK inhibitors and quiescence", c("CDKN1A","CDKN1B","CDKN2A","CDKN1C"), "Not prespecified"),
+
+  module_row("M07", "Stem and LSC",
+    c("CD34","KIT","FLT3","MEIS1","HOXA9","HOXA10","HOXB4","MECOM","PRDM16",
+      "BAALC","GATA2","MLLT3","HLF","MSI2","ADGRG1"), "Up"),
+  module_row("M07", "Myeloid maturation",
+    c("SPI1","CEBPA","CEBPE","ITGAM","CD14","FUT4","MPO","ELANE","CSF1R","LYZ","S100A8","S100A9"), "Down"),
+  module_row("M07", "LSC17",
+    c("DNMT3B","ZBTB46","NYNRIN","ARHGAP22","LAPTM4B","MMRN1","DPYSL3","FAM30A",
+      "CDK6","CPXM1","SOCS2","SMIM24","EMP1","BEX3","CD34","AKR1C3","ADGRG1"), "Published LSC17 score"),
+
+  module_row("M08", "Anti-apoptotic", c("BCL2","MCL1","BCL2L1","BCL2A1","BCL2L2"), "Not prespecified"),
+  module_row("M08", "Effectors", c("BAX","BAK1","BOK"), "Not prespecified"),
+  module_row("M08", "BH3-only", c("BCL2L11","BBC3","PMAIP1","BID","BAD","BIK","BMF","HRK"), "Not prespecified"),
+
+  module_row("M09", "FAO", c("CPT1A","CPT2","ACADM","ACADVL","ACADL","HADHA","HADHB","ECHS1","ACAA2","ACAT1"), "Not prespecified"),
+  module_row("M09", "TCA", c("CS","ACO2","IDH2","IDH3A","OGDH","SUCLG1","SUCLG2","SDHA","SDHB","FH","MDH2"), "Not prespecified"),
+  module_row("M09", "OXPHOS-ETC", c("NDUFS1","NDUFA9","UQCRC1","UQCRC2","COX5A","ATP5F1A","ATP5F1B"), "Not prespecified"),
+  module_row("M09", "Glycolysis contrast", c("HK2","PFKM","PFKL","PKM","LDHA","SLC2A1","ENO1","ALDOA"), "Contrast"),
+
+  module_row("M11", "Checkpoint ligands", c("CD274","PDCD1LG2","LGALS9","IDO1"), "Not prespecified"),
+  module_row("M11", "PGE2 axis", c("PTGS2","PTGES","PTGER4"), "Not prespecified"),
+  module_row("M11", "Other immunosuppressive", c("LGALS1","LGALS3","TGFB1","ARG2","ENTPD1","NT5E"), "Not prespecified")
+))
+
+pair_file_candidates <- c(
+  file.path(params$pairs_root, "results/figures/pairs.csv"),
+  file.path(params$pairs_root, "figures/pairs.csv"),
+  file.path(params$pairs_root, "pairs.csv")
+)
+existing_pair_files <- pair_file_candidates[file.exists(pair_file_candidates)]
+pair_file_modules <- if (length(existing_pair_files)) existing_pair_files[1] else NA_character_
+
+if (!is.na(pair_file_modules)) {
+  xy_pairs_for_modules <- read.delim(pair_file_modules, header = FALSE, sep = ",",
+                                     stringsAsFactors = FALSE)
+  if (ncol(xy_pairs_for_modules) < 2) stop("pairs.csv must contain Y and X symbols in its first two columns.")
+  names(xy_pairs_for_modules)[1:2] <- c("Y_symbol", "X_symbol")
+  xy_pairs_for_modules <- unique(xy_pairs_for_modules[, c("Y_symbol", "X_symbol")])
+  module_definition <- rbind(
+    module_definition,
+    module_row("M10", "Y homologs", xy_pairs_for_modules$Y_symbol, "Lost in LOY"),
+    module_row("M10", "X homologs", xy_pairs_for_modules$X_symbol, "Possible compensation")
+  )
+} else {
+  xy_pairs_for_modules <- data.frame(Y_symbol = character(), X_symbol = character())
+  warning("Module 10 was created, but no pairs.csv was found in the expected locations.")
+}
+
+symbol_aliases <- list(
+  CGAS = c("CGAS", "MB21D1"),
+  STING1 = c("STING1", "TMEM173"),
+  BMI1 = c("BMI1", "PCGF4")
+)
+
+gene_modules_symbols <- setNames(lapply(module_info$module_id, function(mid) {
+  unique(module_definition$requested_symbol[module_definition$module_id == mid])
+}), module_info$module_id)
+
+tx2gene_gene_map <- unique(data.frame(
+  ensembl_gene_id = as.character(tx2gene$gene_id),
+  resolved_symbol = as.character(tx2gene$symbol),
+  stringsAsFactors = FALSE
+))
+tx2gene_gene_map <- tx2gene_gene_map[
+  !is.na(tx2gene_gene_map$ensembl_gene_id) &
+    tx2gene_gene_map$ensembl_gene_id != "" &
+    !is.na(tx2gene_gene_map$resolved_symbol) &
+    tx2gene_gene_map$resolved_symbol != "",
+  , drop = FALSE
+]
+
+resolve_symbol_tx2gene <- function(requested_symbol) {
+  aliases <- unique(c(requested_symbol, symbol_aliases[[requested_symbol]]))
+  candidates <- tx2gene_gene_map[
+    toupper(tx2gene_gene_map$resolved_symbol) %in% toupper(aliases),
+    , drop = FALSE
+  ]
+
+  if (!nrow(candidates)) {
+    return(data.frame(
+      requested_symbol = requested_symbol,
+      resolved_symbol = NA_character_,
+      ensembl_gene_id = NA_character_,
+      ensembl_gene_id_unversioned = NA_character_,
+      id_has_version = FALSE,
+      tx2gene_mapping_status = "not_found_in_tx2gene",
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  candidates <- unique(candidates)
+  candidates$requested_symbol <- requested_symbol
+  candidates$ensembl_gene_id_unversioned <- sub(
+    "\\.[0-9]+$", "", candidates$ensembl_gene_id
+  )
+  candidates$id_has_version <- grepl(
+    "\\.[0-9]+$", candidates$ensembl_gene_id
+  )
+  candidates$tx2gene_mapping_status <- ifelse(
+    toupper(candidates$resolved_symbol) == toupper(requested_symbol),
+    "exact_symbol",
+    paste0("alias:", candidates$resolved_symbol)
+  )
+  candidates[, c(
+    "requested_symbol", "resolved_symbol", "ensembl_gene_id",
+    "ensembl_gene_id_unversioned", "id_has_version",
+    "tx2gene_mapping_status"
+  ), drop = FALSE]
+}
+
+resolve_module_tx2gene <- function(definition) {
+  if (!nrow(definition)) {
+    return(data.frame(
+      module_id = character(), subgroup = character(),
+      requested_symbol = character(), expected_direction = character(),
+      resolved_symbol = character(), ensembl_gene_id = character(),
+      ensembl_gene_id_unversioned = character(), id_has_version = logical(),
+      tx2gene_mapping_status = character(), stringsAsFactors = FALSE
+    ))
+  }
+
+  rows <- lapply(seq_len(nrow(definition)), function(i) {
+    mapped <- resolve_symbol_tx2gene(definition$requested_symbol[i])
+    metadata <- data.frame(
+      module_id = rep(definition$module_id[i], nrow(mapped)),
+      subgroup = rep(definition$subgroup[i], nrow(mapped)),
+      expected_direction = rep(definition$expected_direction[i], nrow(mapped)),
+      stringsAsFactors = FALSE
+    )
+    data.frame(
+      metadata,
+      mapped[, c(
+        "requested_symbol", "resolved_symbol", "ensembl_gene_id",
+        "ensembl_gene_id_unversioned", "id_has_version",
+        "tx2gene_mapping_status"
+      ), drop = FALSE],
+      check.names = FALSE
+    )
+  })
+
+  out <- do.call(rbind, rows)
+  rownames(out) <- NULL
+  out
+}
+
+module_tx2gene_mapping <- setNames(lapply(module_info$module_id, function(mid) {
+  resolve_module_tx2gene(
+    module_definition[module_definition$module_id == mid, , drop = FALSE]
+  )
+}), module_info$module_id)
+
+get_msigdbr_collection <- function(collection) {
+  arguments <- list(species = "Homo sapiens")
+  if ("collection" %in% names(formals(msigdbr::msigdbr))) {
+    arguments$collection <- collection
+  } else {
+    arguments$category <- collection
+  }
+  tryCatch(
+    as.data.frame(do.call(msigdbr::msigdbr, arguments)),
+    error = function(e) {
+      warning("Could not load MSigDB collection ", collection, ": ", conditionMessage(e))
+      data.frame()
+    }
+  )
+}
+
+msig_parts <- Filter(function(x) nrow(x), list(
+  get_msigdbr_collection("H"),
+  get_msigdbr_collection("C2")
+))
+msig_all <- if (length(msig_parts)) do.call(rbind, msig_parts) else data.frame()
+msig_symbol_sets <- if (nrow(msig_all)) {
+  split(as.character(msig_all$gene_symbol), msig_all$gs_name)
+} else {
+  list()
+}
+
+desired_published_sets <- list(
+  M01 = c(
+    "KEGG_ANTIGEN_PROCESSING_AND_PRESENTATION",
+    "REACTOME_CLASS_I_MHC_MEDIATED_ANTIGEN_PROCESSING_PRESENTATION"
+  ),
+  M03 = c(
+    "HALLMARK_INTERFERON_GAMMA_RESPONSE",
+    "HALLMARK_INTERFERON_ALPHA_RESPONSE"
+  ),
+  M05 = c(
+    "BENPORATH_PRC2_TARGETS", "BENPORATH_EED_TARGETS",
+    "BENPORATH_SUZ12_TARGETS", "BENPORATH_ES_WITH_H3K27ME3"
+  ),
+  M06 = c(
+    "HALLMARK_E2F_TARGETS", "HALLMARK_G2M_CHECKPOINT",
+    "HALLMARK_MYC_TARGETS_V1", "HALLMARK_MYC_TARGETS_V2"
+  ),
+  M08 = "HALLMARK_APOPTOSIS",
+  M09 = c(
+    "HALLMARK_FATTY_ACID_METABOLISM",
+    "HALLMARK_OXIDATIVE_PHOSPHORYLATION"
+  )
+)
+
+if (nrow(msig_all)) {
+  available_names <- unique(as.character(msig_all$gs_name))
+  antigen_names <- available_names[
+    grepl("^(KEGG|REACTOME)", available_names) &
+      grepl("ANTIGEN", available_names) &
+      grepl(
+        "MHC.*CLASS_I|CLASS_I.*MHC|ANTIGEN_PROCESSING_AND_PRESENTATION",
+        available_names
+      )
+  ]
+  desired_published_sets$M01 <- unique(c(
+    desired_published_sets$M01,
+    antigen_names
+  ))
+} else {
+  available_names <- character()
+}
+
+published_set_qc <- do.call(rbind, lapply(names(desired_published_sets), function(mid) {
+  data.frame(
+    module_id = mid,
+    gene_set = desired_published_sets[[mid]],
+    source = "MSigDB",
+    availability = ifelse(
+      desired_published_sets[[mid]] %in% available_names,
+      "available", "not_available_in_installed_MSigDB"
+    ),
+    stringsAsFactors = FALSE
+  )
+}))
+published_set_qc <- rbind(
+  published_set_qc,
+  data.frame(
+    module_id = "M07", gene_set = "LSC17_Ng_2016",
+    source = "Ng et al., Nature 2016", availability = "available",
+    stringsAsFactors = FALSE
+  )
+)
+
+signature_symbol_lists <- list()
+signature_manifest_rows <- list()
+
+add_signature <- function(key, module_id, signature, source, symbols,
+                          expected_direction = "Not prespecified") {
+  signature_symbol_lists[[key]] <<- unique(symbols)
+  signature_manifest_rows[[length(signature_manifest_rows) + 1L]] <<- data.frame(
+    signature_key = key,
+    module_id = module_id,
+    signature = signature,
+    source = source,
+    expected_direction = expected_direction,
+    stringsAsFactors = FALSE
+  )
+}
+
+for (mid in module_info$module_id) {
+  module_expected <- module_info$expected[module_info$module_id == mid]
+  simple_expected <- if (module_expected %in% c("Up", "Down")) {
+    module_expected
+  } else {
+    "Not prespecified"
+  }
+  add_signature(
+    paste(mid, "CURATED", sep = "__"),
+    mid, "Curated", "Curated",
+    gene_modules_symbols[[mid]], simple_expected
+  )
+}
+
+lsc17_symbols <- unique(module_definition$requested_symbol[
+  module_definition$module_id == "M07" & module_definition$subgroup == "LSC17"
+])
+add_signature(
+  "M07__LSC17_Ng_2016", "M07", "LSC17_Ng_2016",
+  "Ng et al., Nature 2016", lsc17_symbols, "Up"
+)
+
+published_expected_direction <- function(module_id, set_name) {
+  if (module_id %in% c("M01", "M03", "M05")) "Down" else "Not prespecified"
+}
+
+for (mid in names(desired_published_sets)) {
+  available_sets <- intersect(desired_published_sets[[mid]], available_names)
+  for (set_name in available_sets) {
+    add_signature(
+      paste(mid, set_name, sep = "__"),
+      mid, set_name, "MSigDB",
+      unique(msig_symbol_sets[[set_name]]),
+      published_expected_direction(mid, set_name)
+    )
+  }
+}
+
+signature_manifest <- do.call(rbind, signature_manifest_rows)
+rownames(signature_manifest) <- NULL
+```
+
+The scoring chunk calculates curated and published per-sample signatures as means of gene-wise z-scored raw `gene_cpm`, then tests every score with the existing two-group LOY-versus-WT limma contrast.
+
+```{r module-scores-gene-cpm, results='hide'}
+
+stopifnot(identical(levels(group), c("WT", "LOY")))
+stopifnot(setequal(unique(as.character(group)), c("WT", "LOY")))
+stopifnot(identical(colnames(gene_cpm), rownames(design)))
+
+score_sample_table <- data.frame(
+  sample = colnames(gene_cpm),
+  condition = factor(group[colnames(gene_cpm)], levels = c("WT", "LOY")),
+  row.names = colnames(gene_cpm),
+  stringsAsFactors = FALSE
+)
+
+map_signature_symbols <- function(symbols) {
+  mapped <- do.call(rbind, lapply(unique(symbols), resolve_symbol_tx2gene))
+  rownames(mapped) <- NULL
+  mapped
+}
+
+signature_score_mapping <- lapply(signature_symbol_lists, map_signature_symbols)
+
+score_one_signature <- function(signature_key) {
+  symbols <- signature_symbol_lists[[signature_key]]
+  mapping <- signature_score_mapping[[signature_key]]
+  ids_in_tx2gene <- unique(mapping$ensembl_gene_id[
+    !is.na(mapping$ensembl_gene_id)
+  ])
+  ids <- unique(ids_in_tx2gene[ids_in_tx2gene %in% rownames(gene_cpm)])
+
+  if (length(ids)) {
+    expression <- gene_cpm[ids, colnames(gene_cpm), drop = FALSE]
+    gene_sd <- apply(expression, 1, sd, na.rm = TRUE)
+    expression <- expression[
+      is.finite(gene_sd) & gene_sd > 0, , drop = FALSE
+    ]
+  } else {
+    expression <- gene_cpm[FALSE, , drop = FALSE]
+  }
+
+  if (nrow(expression)) {
+    z_expression <- t(scale(t(expression)))
+    scores <- colMeans(z_expression, na.rm = TRUE)
+    scores[!is.finite(scores)] <- NA_real_
+  } else {
+    scores <- rep(NA_real_, ncol(gene_cpm))
+  }
+
+  data.frame(
+    signature_key = signature_key,
+    sample = colnames(gene_cpm),
+    condition = as.character(score_sample_table$condition),
+    score = as.numeric(scores),
+    n_symbols_requested = length(unique(symbols)),
+    n_symbols_scored = length(unique(mapping$requested_symbol[
+      !is.na(mapping$ensembl_gene_id) &
+        mapping$ensembl_gene_id %in% rownames(expression)
+    ])),
+    n_ensembl_ids_in_tx2gene = length(ids_in_tx2gene),
+    n_ensembl_ids_scored = nrow(expression),
+    stringsAsFactors = FALSE
+  )
+}
+
+signature_score_list <- lapply(names(signature_symbol_lists), score_one_signature)
+names(signature_score_list) <- names(signature_symbol_lists)
+module_score_samples <- do.call(rbind, signature_score_list)
+manifest_index <- match(
+  module_score_samples$signature_key,
+  signature_manifest$signature_key
+)
+module_score_samples$module_id <- signature_manifest$module_id[manifest_index]
+module_score_samples$signature <- signature_manifest$signature[manifest_index]
+module_score_samples$source <- signature_manifest$source[manifest_index]
+module_score_samples <- module_score_samples[, c(
+  "module_id", "signature", "source", "sample", "condition", "score",
+  "n_symbols_requested", "n_symbols_scored", "n_ensembl_ids_in_tx2gene",
+  "n_ensembl_ids_scored", "signature_key"
+), drop = FALSE]
+rownames(module_score_samples) <- NULL
+
+sample_order <- colnames(gene_cpm)
+score_matrix <- do.call(rbind, lapply(signature_score_list, function(x) {
+  setNames(x$score, x$sample)[sample_order]
+}))
+rownames(score_matrix) <- names(signature_score_list)
+colnames(score_matrix) <- sample_order
+valid_signatures <- rowSums(is.finite(score_matrix)) == ncol(score_matrix)
+
+module_score_tests <- signature_manifest
+module_score_tests$mean_score_WT <- rowMeans(
+  score_matrix[, score_sample_table$condition == "WT", drop = FALSE],
+  na.rm = TRUE
+)
+module_score_tests$mean_score_LOY <- rowMeans(
+  score_matrix[, score_sample_table$condition == "LOY", drop = FALSE],
+  na.rm = TRUE
+)
+module_score_tests$score_difference_LOY_minus_WT <- NA_real_
+module_score_tests$t <- NA_real_
+module_score_tests$pvalue <- NA_real_
+module_score_tests$padj <- NA_real_
+module_score_tests$n_symbols_requested <- vapply(
+  signature_score_list, function(x) x$n_symbols_requested[1], integer(1)
+)
+module_score_tests$n_symbols_scored <- vapply(
+  signature_score_list, function(x) x$n_symbols_scored[1], integer(1)
+)
+module_score_tests$n_ensembl_ids_in_tx2gene <- vapply(
+  signature_score_list,
+  function(x) x$n_ensembl_ids_in_tx2gene[1], integer(1)
+)
+module_score_tests$n_ensembl_ids_scored <- vapply(
+  signature_score_list,
+  function(x) x$n_ensembl_ids_scored[1], integer(1)
+)
+
+module_score_tests$mean_score_WT[
+  !is.finite(module_score_tests$mean_score_WT)
+] <- NA_real_
+module_score_tests$mean_score_LOY[
+  !is.finite(module_score_tests$mean_score_LOY)
+] <- NA_real_
+
+if (any(valid_signatures)) {
+  score_fit <- eBayes(
+    contrasts.fit(
+      lmFit(score_matrix[valid_signatures, , drop = FALSE], design),
+      cont
+    )
+  )
+  score_statistics <- topTable(
+    score_fit, coef = "LOY_vs_WT", number = Inf, sort.by = "none"
+  )
+  statistics_index <- match(
+    module_score_tests$signature_key,
+    rownames(score_statistics)
+  )
+  module_score_tests$score_difference_LOY_minus_WT <-
+    score_statistics$logFC[statistics_index]
+  module_score_tests$t <- score_statistics$t[statistics_index]
+  module_score_tests$pvalue <- score_statistics$P.Value[statistics_index]
+  module_score_tests$padj <- score_statistics$adj.P.Val[statistics_index]
+}
+
+module_score_tests$observed_direction <- ifelse(
+  is.na(module_score_tests$score_difference_LOY_minus_WT),
+  "not_tested",
+  ifelse(
+    module_score_tests$score_difference_LOY_minus_WT > 0,
+    "Up", "Down"
+  )
+)
+module_score_tests$direction_concordant <- ifelse(
+  module_score_tests$expected_direction %in% c("Up", "Down") &
+    module_score_tests$observed_direction %in% c("Up", "Down"),
+  module_score_tests$observed_direction == module_score_tests$expected_direction,
+  NA
+)
+module_score_tests$coverage_fraction <- with(
+  module_score_tests,
+  ifelse(
+    n_symbols_requested > 0,
+    n_symbols_scored / n_symbols_requested,
+    NA_real_
+  )
+)
+
+```
+
+The module-heatmap chunk z-scores each curated gene across samples, orders genes by affinity propagation on the correlation similarity matrix without clustering samples, and renders one separate inline and PDF heatmap per analyzable module.
+
+```{r module-heatmaps-apcluster, fig.width=12, fig.height=8, fig.show='asis'}
+module_heatmap_data <- list()
+module_apcluster_results <- list()
+module_heatmap_paths <- setNames(rep(NA_character_, nrow(module_info)), module_info$module_id)
+
+sample_order <- colnames(gene_cpm)
+heatmap_annotation <- data.frame(
+  group = factor(group[sample_order], levels = c("WT", "LOY")),
+  row.names = sample_order
+)
+
+for (i in seq_len(nrow(module_info))) {
+  mid <- module_info$module_id[i]
+  mapping <- module_tx2gene_mapping[[mid]]
+  mapping <- mapping[
+    !is.na(mapping$ensembl_gene_id) &
+      mapping$ensembl_gene_id %in% rownames(gene_cpm),
+    , drop = FALSE
+  ]
+  mapping <- mapping[!duplicated(mapping$ensembl_gene_id), , drop = FALSE]
+
+  if (!nrow(mapping)) {
+    message("Skipping ", mid, " heatmap: no module genes were present in gene_cpm.")
+    next
+  }
+
+  expression <- gene_cpm[mapping$ensembl_gene_id, sample_order, drop = FALSE]
+  gene_sd <- apply(expression, 1, sd, na.rm = TRUE)
+  keep <- is.finite(gene_sd) & gene_sd > 0
+  expression <- expression[keep, , drop = FALSE]
+  mapping <- mapping[keep, , drop = FALSE]
+
+  if (!nrow(expression)) {
+    message("Skipping ", mid, " heatmap: all module genes had zero variance.")
+    next
+  }
+
+  z_expression <- t(scale(t(expression)))
+  row_labels <- ifelse(
+    is.na(mapping$resolved_symbol) | mapping$resolved_symbol == "",
+    mapping$ensembl_gene_id,
+    mapping$resolved_symbol
+  )
+  rownames(z_expression) <- make.unique(row_labels)
+
+  ap_fit <- NULL
+  row_order <- seq_len(nrow(z_expression))
+  ap_cluster <- rep(1L, nrow(z_expression))
+
+  if (nrow(z_expression) >= 2) {
+    similarity_matrix <- apcluster::corSimMat(z_expression)
+    ap_fit <- tryCatch(
+      apcluster::apcluster(
+        s = similarity_matrix,
+        includeSim = TRUE,
+        seed = params$seed
+      ),
+      error = function(e) {
+        warning(mid, " affinity propagation failed: ", conditionMessage(e))
+        NULL
+      }
+    )
+
+    if (!is.null(ap_fit) && length(ap_fit) > 0) {
+      ap_fit <- sort(ap_fit, sortBy = "aggExCluster")
+      ordered_clusters <- lapply(seq_along(ap_fit@clusters), function(k) {
+        cluster_indices <- ap_fit@clusters[[k]]
+        exemplar_index <- ap_fit@exemplars[k]
+        cluster_indices[order(
+          similarity_matrix[cluster_indices, exemplar_index],
+          decreasing = TRUE
+        )]
+      })
+      row_order <- unlist(ordered_clusters, use.names = FALSE)
+      ap_cluster <- rep(
+        seq_along(ordered_clusters),
+        lengths(ordered_clusters)
+      )
+    }
+  }
+
+  z_ordered <- z_expression[row_order, , drop = FALSE]
+  row_annotation <- data.frame(
+    AP_cluster = factor(ap_cluster),
+    row.names = rownames(z_ordered)
+  )
+  cluster_sizes <- as.integer(table(ap_cluster))
+  row_gaps <- if (length(cluster_sizes) > 1) head(cumsum(cluster_sizes), -1) else NULL
+  column_gaps <- which(diff(as.integer(heatmap_annotation$group)) != 0)
+
+  z_for_plot <- pmax(pmin(z_ordered, 3), -3)
+  heatmap_plot <- pheatmap::pheatmap(
+    z_for_plot,
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    gaps_row = row_gaps,
+    gaps_col = column_gaps,
+    annotation_row = row_annotation,
+    annotation_col = heatmap_annotation,
+    annotation_names_row = FALSE,
+    annotation_names_col = FALSE,
+    annotation_colors = list(group = palloy),
+    color = colorRampPalette(c("#2166AC", "white", "#B2182B"))(101),
+    breaks = seq(-3, 3, length.out = 102),
+    border_color = NA,
+    fontsize = 12,
+    fontsize_row = if (nrow(z_ordered) > 60) 11 else 12,
+    fontsize_col = 12,
+    angle_col = "45",
+    main = paste0(mid, ": ", module_info$module[i]),
+    silent = TRUE
+  )
+
+  heatmap_path <- file.path(params$root_path, params$output_dir,
+                            paste0("module_heatmap_", module_info$sheet[i], ".pdf"))
+  grDevices::cairo_pdf(heatmap_path, width = 11,
+                       height = max(5, min(18, 2.5 + 0.22 * nrow(z_ordered))))
+  grid::grid.newpage(); grid::grid.draw(heatmap_plot$gtable); grDevices::dev.off()
+  grid::grid.newpage(); grid::grid.draw(heatmap_plot$gtable)
+
+  module_heatmap_data[[mid]] <- z_ordered
+  module_apcluster_results[[mid]] <- ap_fit
+  module_heatmap_paths[mid] <- heatmap_path
+}
+```
+
+<!-- annotate_rmd figure: source=module_heatmap_M01_MHC_I.pdf | match=dynamic-output-template | bindings=module_info$sheet[i]=M01_MHC_I -->
+
+
+**Module M01 heatmap shows coordinated downregulation of MHC class I antigen presentation genes in LOY cell lines.** Heatmap displaying z-scored expression values for genes in Module M01 (MHC class I antigen presentation). Rows represent individual genes, clustered by affinity propagation to group co-expressed transcripts; columns represent biological samples grouped by genotype (WT or LOY). Color scale ranges from blue (low expression, z < 0) to red (high expression, z > 0), with white indicating mean expression. The principal visible result is the widespread downregulation of MHC class I genes in LOY samples. Sample groups are annotated at the top, and gene clusters are separated by horizontal gaps. Z-scores were calculated per gene across all samples to highlight relative expression differences. The coordinated downregulation of MHC class I genes in the LOY cell-line model supports the hypothesis that LOY intrinsically suppresses antigen presentation machinery. This finding is consistent with patient data showing reduced antigen presentation, suggesting that the cell-line model recapitulates key transcriptional features of LOY-AML blasts.
+
+
+<!-- annotate_rmd figure: source=module_heatmap_M02_Immunoproteasome.pdf | match=dynamic-output-template | bindings=module_info$sheet[i]=M02_Immunoproteasome -->
+
+**Coordinated downregulation of immunoproteasome subunits and peptide processing genes in LOY AML cell lines.** Heatmap showing z-scored expression of genes in Immunoproteasome and peptide processing module across WT and LOY KG-1a cell line samples. Rows represent individual genes, ordered by affinity propagation clustering to group co-expressed transcripts; columns represent biological replicates grouped by genotype. Color scale indicates expression level relative to the mean and standard deviation of each gene across all samples (blue: low, red: high). The principal visible result is the consistent reduction in immunoproteasome subunits (e.g., PSMB8, PSMB9, PSMB10) and activators in LOY samples. No statistical test results or sample sizes are displayed on the figure itself. The visible downregulation of immunoproteasome components in the LOY cell-line model is consistent with the patient-data findings of impaired antigen presentation machinery. This suggests that the loss of Y chromosome intrinsically reprograms proteasome activity in leukemic blasts, potentially contributing to the observed immune evasion phenotype.
+
+
+<!-- annotate_rmd figure: source=module_heatmap_M03_Interferon.pdf | match=dynamic-output-template | bindings=module_info$sheet[i]=M03_Interferon -->
+
+
+**Interferon signaling module genes are predominantly downregulated in LOY KG-1a cells.** Heatmap showing z-scored expression of genes in the Interferon signaling and innate immune sensing module  across WT and LOY KG-1a cell samples. Rows represent individual genes, ordered by affinity propagation clustering to group co-expressed transcripts; columns represent biological replicates grouped by genotype. Expression values are standardized per gene (z-scores) and truncated at ±3 for visualization, with blue indicating lower and red indicating higher expression relative to the mean. The majority of genes show reduced expression (blue) in LOY samples compared to WT, consistent with the module’s expected direction of downregulation. The coordinated downregulation of interferon-related genes in the LOY cell line is consistent with the hypothesis that Y-chromosome loss intrinsically suppresses innate immune sensing pathways. This supports the biological interpretation that LOY confers an immune-evasive phenotype, although the absence of immune cells in this model limits direct inference about patient-level immune remodeling.
+
+
+<!-- annotate_rmd figure: source=module_heatmap_M04_NK_ligands.pdf | match=dynamic-output-template | bindings=module_info$sheet[i]=M04_NK_ligands -->
+
+
+**Expression of NK ligand and MHC-I genes in LOY versus WT KG-1a cells.** Heatmap showing z-scored expression of genes in module NK ligands: missing-self and killing resistance across WT and LOY KG-1a samples. Rows represent individual genes, clustered by affinity propagation to group co-expressed transcripts; columns represent biological samples, ordered by genotype. Color scale indicates relative expression: blue denotes lower expression (z-score < 0), white indicates median expression, and red denotes higher expression (z-score > 0). The annotation bar above the columns distinguishes WT (blue) from LOY (red) samples. The visible pattern shows predominant downregulation of MHC-I related genes in LOY samples, interspersed with upregulated transcripts, reflecting the module's composite nature. The observed downregulation of MHC-I components in the LOY cell-line model is consistent with the patient-derived finding of impaired antigen presentation, supporting the hypothesis that LOY intrinsically alters immune recognition machinery. However, the concurrent upregulation of other module genes suggests that LOY may also induce compensatory or resistance pathways, a complexity that requires validation in the context of the full immune microenvironment.
+
+<!-- annotate_rmd figure: source=module_heatmap_M05_PRC2_H3K27me3.pdf | match=dynamic-output-template | bindings=module_info$sheet[i]=M05_PRC2_H3K27me3 -->
+
+
+**Heterogeneous transcriptional reprogramming of the PRC2 and H3K27me3 chromatin axis in LOY-AML cell lines.** Heatmap showing z-scored expression of genes belonging to PRC2/H3K27me3 axis in WT and LOY KG-1a cell line samples. Rows represent individual genes, clustered by affinity propagation to identify co-expression subgroups; columns represent biological samples, ordered by genotype (WT vs. LOY). Color scale indicates relative expression levels (blue: low, red: high), normalized per gene across all samples. The visible pattern demonstrates mixed regulation, with distinct gene subsets showing either downregulation or upregulation in LOY clones compared to WT controls. The observed mixed regulation within the module is consistent with the hypothesis that LOY acts as a complex modifier of chromatin state rather than a simple suppressor of repressive machinery. This heterogeneity suggests that downstream effects on gene silencing may be nuanced, potentially involving both loss and gain of function within the same pathway.
+
+
+<!-- annotate_rmd figure: source=module_heatmap_M06_Cell_cycle.pdf | match=dynamic-output-template | bindings=module_info$sheet[i]=M06_Cell_cycle -->
+
+**Results.** The heatmap for module M06 (Cell cycle and proliferation) displays a heterogeneous expression pattern across wild-type (WT) and loss-of-Y (LOY) samples, with no uniform directional shift evident at the module level. Genes are clustered into distinct subgroups by affinity propagation, revealing that while some cell-cycle regulators show coordinated upregulation in specific LOY samples, others remain stable or show variable expression across both groups. This lack of a consistent, module-wide transcriptional signature suggests that cell-cycle activity is not globally dysregulated in a uniform manner in this LOY model, contrasting with the more coherent downregulation observed in immune-related modules. Consequently, the cell-line data provide insufficient evidence to support a broad biological interpretation of altered proliferation kinetics as a primary driver of the LOY phenotype, highlighting the need to interpret cell-cycle changes in the context of specific gene subsets rather than the entire module.
+
+
+**Expression of cell cycle and proliferation genes in WT and LOY AML cell lines.** Heatmap showing z-scored expression of genes associated with Cell cycle and proliferation across WT and LOY samples. Rows represent individual genes, clustered by affinity propagation based on correlation similarity, while columns represent biological samples grouped by genotype (WT or LOY). The color scale indicates relative expression levels, with red denoting higher and blue denoting lower expression relative to the mean. No global up- or down-regulation is apparent across the entire module, as genes are distributed into multiple clusters with varying expression patterns. There are two reciprocally regulated cell-cycle gene programs across the analyzed groups. The first gene group, enriched for replication licensing, G1/S transition, proliferation, and mitotic regulators, was coordinately high in WT and reduced in the LOY. Conversely, the second gene group, comprising S-phase, G2/M, G1-entry, and checkpoint-associated genes, was preferentially elevated in the LOY. This reciprocal pattern indicates a shift from a broad, coordinated proliferative program toward a more phase-restricted and checkpoint-constrained cell-cycle state, consistent with altered or delayed cell-cycle progression. 
+
+<!-- annotate_rmd figure: source=module_heatmap_M07_LSC.pdf | match=dynamic-output-template | bindings=module_info$sheet[i]=M07_LSC -->
+
+**Heatmap shows upregulation of stemness and downregulation of maturation genes in LOY cell lines.** Heatmap of z-scored expression values for genes in Differentiation state and stemness across WT and LOY KG-1a cell line samples. Rows represent individual genes clustered by affinity propagation into co-expression subgroups; columns represent biological samples grouped by genotype. Red indicates higher-than-average expression, and blue indicates lower-than-average expression within each gene. The LOY samples show a distinct block of upregulated stemness-associated genes and downregulated maturation markers compared to WT. Z-scores are calculated per gene across all samples. Abbreviations: WT, wild-type; LOY, loss of Y chromosome. The observed upregulation of stemness and downregulation of maturation in the LOY cell lines supports the hypothesis that LOY drives a less differentiated, stem-like leukemic phenotype. 
+
+
+<!-- annotate_rmd figure: source=module_heatmap_M08_Apoptosis.pdf | match=dynamic-output-template | bindings=module_info$sheet[i]=M08_Apoptosis -->
+
+
+**Expression patterns of apoptosis and BCL2 family genes in LOY versus wild-type AML samples.** Heatmap showing z-scored expression values for genes in module M08 (Apoptosis / BCL2 family) across wild-type (WT) and loss-of-Y (LOY) AML samples. Rows represent individual genes, clustered by affinity propagation to group co-expressed transcripts; columns represent samples, ordered by genotype (WT then LOY). Color scale ranges from blue (low expression, z < 0) to red (high expression, z > 0), with white indicating median expression. The Heatmap shows two reciprocally regulated intrinsic-apoptosis gene programs across the analyzed groups. The first gene group, comprising the pro-survival factors BCL2L2, BCL2L1, and MCL1 together with the BH3-only regulators BCL2L11, BBC3, and BIK, was preferentially elevated in LOY, suggesting increased apoptotic priming accompanied by compensatory survival signaling. Conversely, the second gene group, including BCL2, BCL2A1, BAD, BMF, PMAIP1, BAK1, and BAX, was predominantly elevated in WT, while BID and BOK displayed more heterogeneous expression. Collectively, this reciprocal pattern indicates remodeling of mitochondrial apoptotic regulation.
+
+<!-- annotate_rmd figure: source=module_heatmap_M09_Metabolism.pdf | match=dynamic-output-template | bindings=module_info$sheet[i]=M09_Metabolism -->
+
+
+**Affinity propagation clustering reveals metabolic gene expression changes in LOY-AML cell lines.** Heatmap showing z-scored expression values for metabolic genes associated with FAO / TCA / OXPHOS / glycolysis across WT and LOY KG-1a cell line samples.  The visible pattern shows distinct sub-clusters of genes with opposing expression trends in LOY samples compared to WT. WT preferentially expresseS a restricted metabolic program characterized by HK2, PKM, LDHA, CPT1A, ACAT1, and selected respiratory-chain components, whereas LOY exhibits broader, although heterogeneous, induction of TCA-cycle enzymes, fatty-acid oxidation machinery, electron-transport-chain components, and several glucose-utilization genes. This implies a transition from a more glycolysis-associated and selectively mitochondrial state toward increased oxidative metabolic capacity and greater substrate flexibility in LOY. 
+
+
+
+<!-- annotate_rmd figure: source=module_heatmap_M10_XY_dosage.pdf | match=dynamic-output-template | bindings=module_info$sheet[i]=M10_XY_dosage -->
+
+
+**Heatmap reveals heterogeneous X-Y homolog expression patial clear compensatory upregulation in LOY cell lines.** This heatmap displays z-scored expression values for homologues genes between X and Y chromosomes. Rows represent individual genes, ordered by affinity propagation clustering to group co-expressed paralogs, while columns represent biological samples grouped as WT and LOY. The principal visible result is the absence of Y copies of homolg pairs. There is no uniform upregulation of the X-chromosome copies of the pairs in LOY samples, suggesting heterogeneity in transcriptional compensation within the model. For some pairs, compensation is apparent when pooled LOY cells whereas others exhitibt it across individual LOY clones.
+
+<!-- annotate_rmd figure: source=module_heatmap_M11_Other_immune.pdf | match=dynamic-output-template | bindings=module_info$sheet[i]=M11_Other_immune -->
+
+
+**Expression patterns of immune-evasion gene program genes in LOY-AML cell lines.** Heatmap showing z-scored expression values for genes immune-evasion gene program across WT and loss-of-Y LOY KG-1a cell line samples. Rows represent individual genes, clustered by affinity propagation to identify co-expression subgroups, while columns represent biological replicates grouped by genotype. Color scale indicates relative expression intensity, with blue denoting lower and red denoting higher expression relative to the mean. The first gene group, comprising prostaglandin signaling components PTGER4 and PTGS2, the immune checkpoint CD274, the suppressive cytokine TGFB1, the purinergic regulator ENTPD1, and LGALS1, is suppressed in LOY and higher in WT. Conversely, the second gene group, consisting of the immunoregulatory lectins LGALS3 and LGALS9 and the arginine-metabolism enzyme ARG2, are predominantly high in pooled LOY cells. These findings indicate a transition from a broad, coordinated checkpoint, cytokine, prostaglandin, and purinergic immunoregulatory program toward a more restricted and heterogeneous galectin- and arginine metabolism associated state.
+
+The differential-expression export chunk extracts the existing voom fit once, joins complete tx2gene module mappings so filtered genes remain documented with missing statistics, and writes the DE and module-level results to a formatted multi-sheet workbook.
+
+```{r de-table, results='hide'}
+res <- topTable(fit, coef = "LOY_vs_WT", number = Inf, sort.by = "P")
+res$ensembl_gene_id <- rownames(res)
+res$ensembl_gene_id_unversioned <- sub("\\.[0-9]+$", "", res$ensembl_gene_id)
+res$lab <- as.character(gene_annot[res$ensembl_gene_id, "symbol"])
+missing_lab <- is.na(res$lab) | res$lab == ""
+if (any(missing_lab)) {
+  symbol_by_versioned_id <- setNames(tx2gene_gene_map$resolved_symbol, tx2gene_gene_map$ensembl_gene_id)
+  res$lab[missing_lab] <- unname(symbol_by_versioned_id[res$ensembl_gene_id[missing_lab]])
+}
+missing_lab <- is.na(res$lab) | res$lab == ""
+if (any(missing_lab)) {
+  symbol_by_unversioned_id <- setNames(tx2gene_gene_map$resolved_symbol, sub("\\.[0-9]+$", "", tx2gene_gene_map$ensembl_gene_id))
+  res$lab[missing_lab] <- unname(symbol_by_unversioned_id[res$ensembl_gene_id_unversioned[missing_lab]])
+}
+res$sig <- with(res, ifelse(adj.P.Val < 0.05 & logFC > 1, "Up",
+                           ifelse(adj.P.Val < 0.05 & logFC < -1, "Down", "n.s.")))
+id_cols <- c("ensembl_gene_id", "ensembl_gene_id_unversioned", "lab")
+res <- res[, c(id_cols, setdiff(names(res), id_cols)), drop = FALSE]
+message(sprintf("Up: %d | Down: %d | tested: %d", sum(res$sig == "Up"), sum(res$sig == "Down"), nrow(res)))
+up <- res[res$sig == "Up", , drop = FALSE]; up <- up[order(up$adj.P.Val), , drop = FALSE]
+down <- res[res$sig == "Down", , drop = FALSE]; down <- down[order(down$adj.P.Val), , drop = FALSE]
+
+attach_existing_res <- function(mapping) {
+  if (!nrow(mapping)) {
+    result_columns <- setdiff(names(res), c("ensembl_gene_id", "ensembl_gene_id_unversioned"))
+    return(data.frame(mapping, de_status = character(),
+                      res[integer(), result_columns, drop = FALSE], check.names = FALSE))
+  }
+  result_index <- match(mapping$ensembl_gene_id, res$ensembl_gene_id)
+  needs_unversioned_match <- is.na(result_index) & !is.na(mapping$ensembl_gene_id_unversioned)
+  result_index[needs_unversioned_match] <- match(
+    mapping$ensembl_gene_id_unversioned[needs_unversioned_match],
+    res$ensembl_gene_id_unversioned
+  )
+  result_columns <- setdiff(names(res), c("ensembl_gene_id", "ensembl_gene_id_unversioned"))
+  existing_results <- res[result_index, result_columns, drop = FALSE]
+  rownames(existing_results) <- NULL
+  de_status <- ifelse(is.na(mapping$ensembl_gene_id), "not_found_in_tx2gene",
+                      ifelse(is.na(result_index), "filtered_before_voom", "tested_in_voom"))
+  out <- data.frame(mapping, de_status, existing_results, check.names = FALSE)
+  rownames(out) <- NULL
+  out
+}
+module_gene_tables <- lapply(module_tx2gene_mapping, attach_existing_res)
+
+module_mapping_qc <- do.call(rbind, lapply(
+  module_info$module_id,
+  function(module_id) {
+    x <- module_gene_tables[[module_id]]
+    x[, c(
+      "module_id", "subgroup", "requested_symbol", "expected_direction",
+      "resolved_symbol", "ensembl_gene_id",
+      "ensembl_gene_id_unversioned", "id_has_version",
+      "tx2gene_mapping_status", "de_status", "lab"
+    ), drop = FALSE]
+  }
+))
+rownames(module_mapping_qc) <- NULL
+
+title_style <- createStyle(fontSize = 14, textDecoration = "bold", fontColour = "#FFFFFF",
+                           fgFill = "#1F4E78", halign = "left", valign = "center")
+section_style <- createStyle(textDecoration = "bold", fontColour = "#FFFFFF", fgFill = "#5B9BD5")
+header_style <- createStyle(textDecoration = "bold", fontColour = "#FFFFFF", fgFill = "#4472C4",
+                            border = "Bottom", borderColour = "#D9E2F3")
+number_style <- createStyle(numFmt = "0.0000")
+pvalue_style <- createStyle(numFmt = "0.00E+00")
+
+style_table <- function(wb, sheet, x, header_row, data_row) {
+  addStyle(wb, sheet, header_style, rows = header_row, cols = seq_len(ncol(x)),
+           gridExpand = TRUE, stack = TRUE)
+  if (!nrow(x)) return(invisible(NULL))
+  rows <- seq.int(data_row, length.out = nrow(x))
+  numeric_cols <- which(vapply(x, is.numeric, logical(1)))
+  pvalue_cols <- grep("(^|[._])(pvalue|padj|p.value|adj.p.val|fdr)$", names(x), ignore.case = TRUE)
+  regular_cols <- setdiff(numeric_cols, pvalue_cols)
+  if (length(regular_cols)) addStyle(wb, sheet, number_style, rows, regular_cols, gridExpand = TRUE, stack = TRUE)
+  if (length(pvalue_cols)) addStyle(wb, sheet, pvalue_style, rows, pvalue_cols, gridExpand = TRUE, stack = TRUE)
+}
+
+write_block <- function(wb, sheet, section_title, x, start_row) {
+  writeData(wb, sheet, section_title, startRow = start_row, colNames = FALSE)
+  addStyle(wb, sheet, section_style, rows = start_row, cols = 1, stack = TRUE)
+  if (is.null(x) || !nrow(x)) x <- data.frame(Note = "No rows were available.")
+  x <- as.data.frame(x, stringsAsFactors = FALSE)
+  writeData(wb, sheet, x, startRow = start_row + 1, rowNames = FALSE, keepNA = TRUE)
+  style_table(wb, sheet, x, start_row + 1, start_row + 2)
+  start_row + nrow(x) + 3
+}
+
+write_simple_sheet <- function(wb, sheet, x) {
+  addWorksheet(wb, sheet)
+  writeData(wb, sheet, x, rowNames = FALSE, keepNA = TRUE)
+  style_table(wb, sheet, x, 1, 2)
+  freezePane(wb, sheet, firstRow = TRUE)
+  setColWidths(wb, sheet, cols = seq_len(ncol(x)), widths = "auto")
+}
+
+wb <- createWorkbook()
+
+msigdb_version <- if (
+  nrow(msig_all) && "db_version" %in% colnames(msig_all)
+) {
+  paste(unique(msig_all$db_version), collapse = "; ")
+} else {
+  "Unavailable"
+}
+
+readme_table <- data.frame(
+  Field = c(
+    "Workbook purpose",
+    "Gene-level DE source",
+    "Module gene identifiers",
+    "Module score",
+    "Score-level test",
+    "Heatmap ordering",
+    "Sample ordering",
+    "Published signatures",
+    "MSigDB version",
+    "X-Y pair results",
+    "Author"
+  ),
+  Value = c(
+    "LOY-versus-WT differential expression with curated module worksheets",
+    "The existing res table extracted once from the existing limma-voom fit; no module-specific gene-level fit",
+    "All requested symbols are resolved through tx2gene so genes filtered before voom retain versioned Ensembl IDs",
+    "Per-sample mean of gene-wise z-scored TMM-normalized gene_cpm",
+    "Module scores tested with the existing WT/LOY design and LOY-WT contrast",
+    "Curated module genes ordered by apcluster using corSimMat",
+    "Existing sample order is preserved; samples are not clustered",
+    "Requested MSigDB signatures and LSC17 are scored alongside curated modules",
+    msigdb_version,
+    "Not duplicated here because the X-Y pair analysis is performed separately",
+    "Koray Dogan Kaya"
+  ),
+  stringsAsFactors = FALSE
+)
+
+write_simple_sheet(wb, "README", readme_table)
+setColWidths(wb, "README", cols = 1, widths = 30)
+setColWidths(wb, "README", cols = 2, widths = 110)
+wrap_style <- createStyle(wrapText = TRUE, valign = "top")
+addStyle(
+  wb, "README", wrap_style,
+  rows = seq_len(nrow(readme_table) + 1),
+  cols = 2,
+  gridExpand = TRUE,
+  stack = TRUE
+)
+
+write_simple_sheet(wb, "UpRegulated", up)
+write_simple_sheet(wb, "DownRegulated", down)
+write_simple_sheet(wb, "Module_summary", module_score_tests)
+write_simple_sheet(wb, "Module_mapping_QC", module_mapping_qc)
+write_simple_sheet(wb, "Published_set_QC", published_set_qc)
+
+for (i in seq_len(nrow(module_info))) {
+  module_id <- module_info$module_id[i]
+  sheet <- module_info$sheet[i]
+  module_table <- module_gene_tables[[module_id]]
+  signature_summary <- module_score_tests[
+    module_score_tests$module_id == module_id,
+    , drop = FALSE
+  ]
+  signature_samples <- module_score_samples[
+    module_score_samples$module_id == module_id,
+    , drop = FALSE
+  ]
+
+  addWorksheet(wb, sheet)
+  writeData(
+    wb, sheet, module_info$module[i],
+    startRow = 1,
+    startCol = 1,
+    colNames = FALSE
+  )
+  mergeCells(wb, sheet, cols = 1:8, rows = 1)
+  addStyle(
+    wb, sheet, title_style,
+    rows = 1,
+    cols = 1:8,
+    gridExpand = TRUE,
+    stack = TRUE
+  )
+  setRowHeights(wb, sheet, rows = 1, heights = 24)
+
+  metadata <- data.frame(
+    Field = c(
+      "Module ID",
+      "Expected LOY vs WT",
+      "Gene-level DE source",
+      "Score input",
+      "Heatmap PDF"
+    ),
+    Value = c(
+      module_id,
+      module_info$expected[i],
+      "Existing res; no module-specific gene-level fit",
+      "Gene-wise z-scored gene_cpm",
+      module_heatmap_paths[module_id]
+    ),
+    stringsAsFactors = FALSE
+  )
+  writeData(
+    wb, sheet, metadata,
+    startRow = 3,
+    startCol = 1,
+    colNames = FALSE,
+    rowNames = FALSE
+  )
+  addStyle(
+    wb, sheet,
+    createStyle(textDecoration = "bold"),
+    rows = 3:7,
+    cols = 1,
+    gridExpand = TRUE,
+    stack = TRUE
+  )
+
+  next_row <- 9
+  next_row <- write_block(
+    wb, sheet,
+    "Signature-level LOY versus WT tests",
+    signature_summary,
+    next_row
+  )
+  next_row <- write_block(
+    wb, sheet,
+    "Per-sample module scores from gene_cpm z-scores",
+    signature_samples,
+    next_row
+  )
+  next_row <- write_block(
+    wb, sheet,
+    "Existing gene-level DE rows joined to complete tx2gene mapping",
+    module_table,
+    next_row
+  )
+
+  freezePane(
+    wb, sheet,
+    firstActiveRow = 9,
+    firstActiveCol = 1
+  )
+  setColWidths(
+    wb, sheet,
+    cols = seq_len(max(1, ncol(module_table))),
+    widths = "auto"
+  )
+}
+
+workbook_path <- file.path(params$root_path, params$output_dir, "DE_LOY_vs_WT.xlsx")
+saveWorkbook(wb, workbook_path, overwrite = TRUE)
+message("Saved expanded DE workbook: ", workbook_path)
+```
+
+The volcano-plot chunk displays the existing voom log2 fold changes against nominal significance, labels the ten strongest upregulated and downregulated genes, and saves the figure.
+
+```{r de-volcano, fig.width=6.5, fig.height=5.5}
+vcol <- c(Up = "#B2182B", Down = "#2166AC", "n.s." = "grey75")
+n_each <- 10
+up_g   <- head(rownames(res)[res$sig == "Up"  ][order(res$P.Value[res$sig == "Up"  ])], n_each)
+down_g <- head(rownames(res)[res$sig == "Down"][order(res$P.Value[res$sig == "Down"])], n_each)
+lab_g  <- c(up_g, down_g)
+ggplot(res, aes(logFC, -log10(P.Value), colour = sig)) +
+  geom_point(size = 1, alpha = 0.7) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", colour = "grey50") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey50") +
+  ggrepel::geom_text_repel(data = subset(res, rownames(res) %in% lab_g),
+    aes(label = lab), size = 3, max.overlaps = Inf, show.legend = FALSE) +
+  scale_colour_manual(values = vcol, name = NULL) +
+  labs(x = "log2 fold change", y = "-log10 P", title = sprintf("%s vs %s", "LOY", "")) +
+  theme_minimal(base_size = 11)
+ggsave(file.path(params$root_path, params$output_dir, "fig9_VolcanoPlot.pdf"), device = cairo_pdf)
+```
+
+<!-- annotate_rmd figure: source=fig9_VolcanoPlot.pdf | match=explicit-output-template -->
+
+**Results.** The volcano plot visualizes the differential gene expression between LOY and wild-type KG-1a cell lines, revealing a substantial number of significantly upregulated and downregulated genes. The most statistically significant downregulated genes include immunoglobulin heavy chain transcripts (IGHJ3, IGHM) and the transporter LAT2, while the most significant upregulated genes include metabolic and stress-response factors such as HK1, NFE2, and CKB. This pattern of transcriptional reprogramming in the isogenic model is consistent with the direction of changes observed in patient data, particularly regarding the downregulation of immune-related pathways. However, the prominence of immunoglobulin genes in the cell line, which are not typically expressed in AML blasts, highlights a limitation of this model in fully recapitulating the specific leukemic transcriptome of patient samples.
+
+
+**Differential gene expression in LOY versus wild-type KG-1a cells.** Volcano plot showing the log2 fold change (x-axis) versus the negative log10 P-value (y-axis) for genes differentially expressed between WT and LOY KG-1a cell lines. Points are colored by significance and direction: blue for downregulated, red for upregulated, and grey for non-significant (n.s.) genes. Dashed lines indicate a fold change threshold of ±1 and a P-value threshold of 0.05. The ten most significant upregulated and downregulated genes are labeled. The plot demonstrates widespread transcriptional changes, with immunoglobulin transcripts, including IGHJ3 and IGHM, and LAT2 among the most significantly downregulated genes, whereas metabolic and stress-response factors such as HK1, NFE2, and CKB are among the most significantly upregulated genes. The observed downregulation of immune-related transcripts in the LOY cell line supports the hypothesis that LOY impairs antigen presentation machinery, consistent with patient findings. 
+
+
+The mean-difference chunk plots average voom expression against LOY-versus-WT log2 fold change and saves the corresponding MD figure.
+
+```{r de-md, fig.width=6.5, fig.height=5}
+ggplot(res, aes(AveExpr, logFC, colour = sig)) +
+  geom_point(size = 1, alpha = 0.7) +
+  geom_hline(yintercept = 0, colour = "grey30") +
+  geom_hline(yintercept = c(-1, 1), linetype = "dashed", colour = "grey50") +
+  scale_colour_manual(values = vcol, name = NULL) +
+  labs(x = "Average log2-CPM", y = "log2 fold change",
+       title = sprintf("MD plot: %s vs %s", "LOY", "WT")) +
+  theme_minimal(base_size = 11)
+ggsave(file.path(params$root_path, params$output_dir, "fig8_MD_Plot.pdf"), device = cairo_pdf)
+```
+
+<!-- annotate_rmd figure: source=fig8_MD_Plot.pdf | match=explicit-output-template -->
+
+
+**Global transcriptional reprogramming in the LOY versus WT cell-line model.** Mean-difference (MD) plot showing the relationship between average expression and log2 fold change for genes differentially expressed between LOY and WT samples. The x-axis represents the average log2 counts per million (log2-CPM), and the y-axis represents the log2 fold change. Genes are colored by significance status: red indicates significant upregulation, blue indicates significant downregulation, and grey indicates non-significant changes. Dashed horizontal lines denote log2 fold change thresholds of ±1. The plot demonstrates a wide distribution of significant transcriptional changes associated with LOY in this model. The extensive distribution of differentially expressed genes suggests that LOY induces a robust transcriptional shift in the KG-1a cell line. 
+
+The differential-expression heatmap chunk selects the 25 largest positive and negative significant fold changes, visualizes their log2-CPM profiles, and saves the clustered heatmap.
+
+```{r de-heatmap, fig.width=7, fig.height=9}
+genemat <- log2(gene_cpm + 1)
+up_g <- rownames(res)[res$adj.P.Val <= 0.05 & res$logFC >= 1]
+down_g <- rownames(res)[res$adj.P.Val <= 0.05 & res$logFC <= -1]
+up_g <- up_g[order(res[up_g, "logFC"], decreasing = TRUE)]
+down_g <- down_g[order(res[down_g, "logFC"])]
+topg <- c(head(up_g, 25), head(down_g, 25))
+mat <- genemat[topg, , drop = FALSE]
+ann_col <- data.frame(group = group[colnames(mat)], row.names = colnames(mat))
+ann_colors <- list(group = palloy)
+lim <- max(abs(quantile(mat, c(.02, .98))))
+fs <- 8; glw <- 0.5
+heatmap_args <- list(
+  mat = mat[, names(group)],
+  color  = colorRampPalette(rev(c("#A50026","#D73027","#F46D43","#FDAE61","#FEE090","#FFFFBF",
+                                  "#E0F3F8","#ABD9E9","#74ADD1")))(100),
+  breaks = seq(0, lim, length.out = 101),
+  border_color = "gray",
+  cellheight = fs + 2 * glw,
+  fontsize_row = fs,
+  labels_row = if ("lab" %in% colnames(res)) res[topg, "lab"] else topg,
+  cluster_rows = TRUE, cluster_cols = TRUE,
+  annotation_col = ann_col, annotation_colors = ann_colors, show_colnames = TRUE,
+  main = "Top 25 up + 25 down DE genes  log2(CPM+1): LOY vs WT",
+  silent = TRUE
+)
+p <- do.call(pheatmap, heatmap_args)
+grid::grid.newpage(); grid::grid.draw(p$gtable)
+cairo_pdf(file.path(params$root_path, params$output_dir, "heatmaP50.pdf"), width = 9, height = 8.2)
+grid::grid.newpage(); grid::grid.draw(p$gtable); dev.off()
+```
+
+<!-- annotate_rmd figure: source=heatmaP50.pdf | match=explicit-output-template -->
+
+
+**Transcriptional divergence between LOY and WT samples in top differentially expressed genes.** Clustered heatmap showing the top 25 upregulated and 25 downregulated genes (adjusted P ≤ 0.05, |log2FC| ≥ 1) comparing LOY and WT samples. Rows represent genes, columns represent samples (WT1-3, LOY1-3, LOY-C1-4). Color scale indicates log2(CPM+1) expression levels, with red denoting high and blue denoting low expression. Samples are annotated by group (WT: black, LOY: pink). Hierarchical clustering reveals distinct gene expression profiles associated with LOY status.Heatmap showing two strongly reciprocal transcriptional programs across the analyzed groups. In LOY  immunoglobulin associated transcripts, including IGHM and multiple IGHJ segments, together with hematopoietic and progenitor-related genes such as CD34, PTPRCAP, HOXA7, and HOXA9 are downregulated; the Y-linked transcript RPS4Y1 was also restricted to this group. In contrast, coordinated induction of germline-associated genes, including CTAG2, MAGEA3/6, multiple GAGE family members, PRAME, and RHOXF2/RHOXF2B, accompanied by developmental or oncofetal regulators such as DLK1, PITX1, GAL, and NMU and erythroid-megakaryocytic genes including HBE1, HBG1/2, HBA1, and GP1BB are upregulated. This reciprocal pattern is consistent with a marked transition from a hematopoietic progenitor and immunoglobulin-associated state toward an oncofetal, germline-like, and erythroid-associated transcriptional identity. 
+
+
+The Hallmark enrichment chunk applies `camera` to versionless Ensembl identifiers, plots significant pathway direction and significance, and displays and saves a barcode plot for the strongest set.
+
+```{r camera, fig.width=8, fig.height=9}
+strip <- function(x) sub("\\..*", "", x)
+vv <- v; rownames(vv) <- strip(rownames(vv))
+m <- msigdbr(species = "Homo sapiens", collection = "H")
+ens_col <- grep("ensembl", colnames(m), ignore.case = TRUE, value = TRUE)[1]
+idx <- ids2indices(split(m[[ens_col]], m$gs_name), rownames(vv))
+con <- makeContrasts(contrasts = paste0("LOY", "-", "WT"), levels = design)
+cam <- camera(vv, idx, design, contrast = con[, 1])
+cam$Set <- sub("^HALLMARK_", "", rownames(cam))
+sig <- cam[cam$FDR <= 0.05, ]; if (nrow(sig) <= 1) sig <- head(cam, 15)
+top <- head(sig, 50)
+top$signed <- ifelse(top$Direction == "Up", 1, -1) * -log10(top$FDR)
+top <- top[order(top$signed), ]; top$Set <- factor(top$Set, levels = top$Set)
+print(
+ggplot(top, aes(signed, Set, fill = Direction)) +
+  geom_col(width = 0.7) +
+  geom_vline(xintercept = 0, colour = "grey40") +
+  scale_fill_manual(values = c(Up = "#B2182B", Down = "#2166AC")) +
+  labs(x = expression(-log[10]*"(FDR) × direction"), y = NULL,
+       title = sprintf("camera: Hallmark sets - %s vs %s", "LOY", "WT")) +
+  theme_minimal(base_size = 11)
+)
+ggsave(file.path(params$root_path, params$output_dir, "camera_hallmark.pdf"), device = cairo_pdf)
+efit <- eBayes(contrasts.fit(lmFit(vv, design), con))
+barcodeplot(efit$t[, 1], index = idx[[rownames(cam)[1]]],
+            main = sub("^HALLMARK_", "", rownames(cam)[1]),
+            xlab = sprintf("moderated t  (%s vs %s)", "LOY","WT"))
+cairo_pdf(file.path(params$root_path, params$output_dir, "camera_barcode.pdf"), width = 8, height = 7)
+barcodeplot(efit$t[, 1], index = idx[[rownames(cam)[1]]],
+            main = sub("^HALLMARK_", "", rownames(cam)[1]),
+            xlab = sprintf("moderated t  (%s vs %s)", "LOY","WT"))
+dev.off()
+```
+
+<!-- annotate_rmd figure: source=camera_barcode.pdf | match=explicit-output-template -->
+
+**Enrichment analysis shows downregulation of interferon-alpha response in LOY cell lines.** Gene set enrichment analysis was performed using the CAMERA method to evaluate MSigDB Hallmark gene sets in the differential expression results between LOY and WT samples. The figure displays a barcode plot for the INTERFERON_ALPHA_RESPONSE gene set, which was identified as significantly enriched. The x-axis represents the moderated t-statistic for the LOY versus WT contrast, with genes ranked from most downregulated (left) to most upregulated (right). The upper panel shows the running enrichment score, which decreases as the gene set members are encountered. The lower panel indicates the position of gene set members (vertical lines) relative to the ranked list, with the blue region denoting downregulated genes. The concentration of hits in the negative t-statistic range indicates that the interferon-alpha response pathway is coordinately suppressed in LOY cells. LOY, loss of Y chromosome; WT, wild type. The downregulation of the interferon-alpha response in the LOY cell-line model supports the hypothesis that LOY drives a transcriptional program characterized by reduced inflammatory signaling. This intrinsic suppression is consistent with the patient data showing impaired antigen presentation, suggesting that LOY may contribute to immune evasion by dampening key immune signaling pathways within the leukemia cells.
+
+
+<!-- annotate_rmd figure: source=camera_hallmark.pdf | match=explicit-output-template -->
+
+
+**CAMERA analysis reveals downregulation of interferon response pathways in LOY samples.** Gene set enrichment analysis was performed using the CAMERA method to identify significantly altered MSigDB Hallmark gene sets in LOY versus WT samples. The horizontal bar plot displays the top 50 significant sets, ranked by significance. The x-axis represents the negative log10 false discovery rate (FDR) multiplied by the direction of enrichment (up or down). Blue bars indicate downregulated pathways, while red bars indicate upregulated pathways. The analysis reveals a strong downregulation of interferon alpha and gamma response pathways, as well as allograft rejection signatures. In contrast, heme metabolism is significantly upregulated. These results highlight the coordinated suppression of immune-related transcriptional programs in LOY samples. The downregulation of interferon response pathways in LOY samples is consistent with the observed impairment in antigen presentation machinery. This suggests that LOY may broadly suppress immune signaling pathways, potentially contributing to the altered immune competence observed in LOY-AML patients.
+
+The activity-inference chunk converts moderated gene statistics to a unique symbol-level signature, infers PROGENy pathway and high-confidence DoRothEA transcription-factor activities, and saves both ranked activity plots.
+
+```{r decoupler, fig.width=8, fig.height=7}
+sg <- data.frame(sym = res$lab, stat = res$t)
+sg  <- sg[!is.na(sg$sym) & sg$sym != "", ]
+sg <- sg[order(-abs(sg$stat)), ]; sg <- sg[!duplicated(sg$sym), ]
+mat <- matrix(sg$stat, ncol = 1, dimnames = list(sg$sym, "contrast"))
+OmnipathR::omnipath_cache_wipe()
+library(progeny)
+pmat <- as.matrix(progeny::getModel("Human", top = 500))
+prog <- data.frame(
+  source = rep(colnames(pmat), each = nrow(pmat)),
+  target = rep(rownames(pmat), times = ncol(pmat)),
+  weight = as.numeric(pmat),
+  stringsAsFactors = FALSE
+)
+prog <- prog[prog$weight != 0, ]
+stopifnot(all(c("source", "target", "weight") %in% names(prog)))
+act_p <- decoupleR::run_mlm(mat, prog, .source = "source", .target = "target", .mor = "weight", minsize = 5)
+pp <- subset(act_p, statistic == "mlm"); pp <- pp[order(pp$score), ]
+pp$source <- factor(pp$source, levels = pp$source)
+print(
+ggplot(pp, aes(score, source, fill = score > 0)) +
+  geom_col(width = 0.7) + geom_vline(xintercept = 0, colour = "grey40") +
+  scale_fill_manual(values = c(`TRUE` = "#B2182B", `FALSE` = "#2166AC"), guide = "none") +
+  labs(x = "PROGENy activity (mlm score)", y = NULL,
+       title = sprintf("Pathway activity - %s vs %s", "LOY","WT")) +
+  theme_minimal(base_size = 11)+theme(axis.text.y = element_text(size = 12))  
+)
+ggsave(file.path(params$root_path, params$output_dir, "progeny.pdf"), device = cairo_pdf)
+data(dorothea_hs, package = "dorothea")
+tri <- subset(dorothea_hs, confidence %in% c("A", "B", "C"))
+tri <- data.frame(source = tri$tf, target = tri$target, mor = tri$mor, stringsAsFactors = FALSE)
+stopifnot(length(intersect(rownames(mat), tri$target)) > 50)
+act_t <- decoupleR::run_ulm(mat, tri, .source = "source", .target = "target",
+                            .mor = "mor", minsize = 5)
+tt <- subset(act_t, statistic == "ulm")
+tt <- tt[order(-abs(tt$score)), ][1:25, ]
+tt <- tt[order(tt$score), ]; tt$source <- factor(tt$source, levels = tt$source)
+tt$sig <- ifelse(tt$p_value < 0.05, "p<0.05", "n.s.")
+
+print(
+ggplot(tt, aes(score, source, fill = score > 0, alpha = sig)) +
+  geom_col(width = 0.7) +
+  geom_vline(xintercept = 0, colour = "grey40") +
+  scale_fill_manual(values = c(`TRUE` = "#B2182B", `FALSE` = "#2166AC"), guide = "none") +
+  scale_alpha_manual(values = c(`p<0.05` = 1, `n.s.` = 0.4), name = NULL) +
+  labs(x = "TF activity (ulm score)", y = NULL,
+       title = sprintf("Top 25 TFs by |activity| - %s vs %s", "LOY", "WT")) +
+  theme_minimal(base_size = 11)
+)
+ggsave(file.path(params$root_path, params$output_dir, "tfactivity.pdf"), device = cairo_pdf)
+```
+
+<!-- annotate_rmd figure: source=progeny.pdf | match=explicit-output-template -->
+**PROGENy analysis reveals pathway changes in LOY** LOY cells exhibit profound suppression of JAK–STAT signaling, accompanied by broader attenuation of death-receptor, inflammatory, developmental, and survival pathways and modest activation of p53- and VEGF-associated responses. PROGENy pathway activities were inferred from transcriptional footprints using multivariate linear modeling. JAK–STAT showed the strongest reduction in LOY relative to WT cells, followed by TRAIL, WNT, PI3K, TNFα, estrogen, and TGFβ signaling, while androgen, MAPK, and hypoxia activities were more modestly decreased. In contrast, p53 displayed the strongest increase, with smaller increases in VEGF and EGFR activity, whereas NF-κB remained largely unchanged. Positive red scores indicate increased inferred activity in LOY cells, and negative blue scores indicate decreased activity relative to WT cells.
+
+<!-- annotate_rmd figure: source=tfactivity.pdf | match=explicit-output-template -->
+
+**PROGENy analysis reveals TF activity changes in LOY** LOY cells display selective activation of a small transcriptional-regulatory program alongside broad suppression of hematopoietic lineage, immune-response, and developmental regulators. Transcription-factor activities were inferred from regulon target expression using univariate linear modeling. KLF5 and FOXP1 showed the strongest increases, followed by THAP1, BCL6, and FOXK2, indicating enhanced activity of regulators associated with proliferation, survival, and transcriptional repression. In contrast, the strongest reductions involved the hematopoietic and lineage regulators LYL1, KMT2A, EBF1, MEF2C, MEF2A, SPI1, and TCF7; the interferon and immune-response factors STAT2, IRF9, IRF4, and TBX21; and developmental regulators including MEIS1 and RBPJ. Positive red scores indicate higher inferred activity in LOY cells, whereas negative blue scores indicate lower activity relative to WT cells; displayed activities met the significance threshold of p < 0.05.
+
+
+The enrichment-export chunk writes the complete camera, PROGENy, and DoRothEA result tables to a formatted three-sheet workbook.
+
+```{r export-enrichment, results='hide'}
+cam_out <- data.frame(gene_set = rownames(cam), cam, row.names = NULL)
+
+prog_out <- as.data.frame(subset(act_p, statistic == "mlm"))
+prog_out <- prog_out[order(-abs(prog_out$score)), ]
+tf_out <- as.data.frame(subset(act_t, statistic == "ulm"))
+tf_out <- tf_out[order(-abs(tf_out$score)), ]
+wb <- createWorkbook()
+for (nm in c("Hallmark_camera", "PROGENy_pathways", "TF_activity")) addWorksheet(wb, nm)
+writeData(wb, "Hallmark_camera",  cam_out)
+writeData(wb, "PROGENy_pathways", prog_out)
+writeData(wb, "TF_activity", tf_out)
+for (nm in names(wb)) {
+  addStyle(wb, nm, createStyle(textDecoration = "bold"), rows = 1,
+           cols = seq_len(ncol(read.xlsx(wb, nm))), gridExpand = TRUE)
+  freezePane(wb, nm, firstRow = TRUE)
+  setColWidths(wb, nm, cols = seq_len(20), widths = "auto")
+}
+
+saveWorkbook(wb, file.path(params$root_path, params$output_dir, "enrichment_LOY_vs_WT.xlsx"), overwrite = TRUE)
+```
+
+The X-Y mapping chunk reads the predefined homolog pairs, resolves each symbol to the analysis Ensembl identifiers, and extracts their normalized gene CPM profiles.
+
+```{r honologues-dotplot, fig.width=9, fig.height=5.5, results='hide'}
+hgenes <- read.delim(file.path(params$pairs_root, "pairs.csv"), header = FALSE, sep = ",")
+names(hgenes) <- c("Y", "X", "onX")
+sel_pairs <- data.frame(do.call(rbind, lapply(seq_len(nrow(hgenes)), function(i) {
+  x <- as.character(hgenes[i, ])
+  c(pair = paste0(x[1], "-", x[2]),
+    geneX = gene_annot[gene_annot$symbol == x[2], "gene_id"],
+    geneY = gene_annot[gene_annot$symbol == x[1], "gene_id"])
+})))
+hgeneids <- unlist(sel_pairs[c("geneX", "geneY")])
+hmat <- gene_cpm[hgeneids, ]
+```
+
+The pair-level voom chunk replaces each X-Y pair with its summed count profile, reuses the original library normalization, and formally tests total pair dosage in LOY versus WT.
+
+```{r voom-de-pair, results='hide'}
+xgenes <- as.character(sel_pairs[, 2])
+ygenes <- as.character(sel_pairs[, 3])
+pair_feature <- paste0("PAIR__", xgenes, "__", ygenes)
+pair_counts <- do.call(rbind, lapply(seq_along(xgenes), function(i) {
+  y.gene$counts[xgenes[i], ] + y.gene$counts[ygenes[i], ]
+}))
+rownames(pair_counts) <- pair_feature
+colnames(pair_counts) <- colnames(y.gene$counts)
+pair_matrix <- rbind(
+  y.gene$counts[!rownames(y.gene$counts) %in% hgeneids, , drop = FALSE],
+  pair_counts
+)
+y.pair <- DGEList(counts = pair_matrix, group = group)
+y.pair$samples$lib.size <- y.gene$samples$lib.size
+y.pair$samples$norm.factors <- y.gene$samples$norm.factors
+v.pair <- voom(y.pair, design, plot = FALSE)
+fit.pair <- eBayes(contrasts.fit(lmFit(v.pair, design), cont), robust = TRUE)
+res.pair <- topTable(fit.pair, coef = "LOY_vs_WT", number = Inf, sort.by = "none")
+```
+The X-Y summary chunk calculates group-average homolog expression, baseline Y contribution, X compensation efficiency, retained total dosage, individual X-gene DE, and formal pair-level DE before exporting the complete table.
+
+```{r xyhomology, results='hide'}
+xyhomologt2 <- t(sapply(seq_len(nrow(sel_pairs)), function(i) {
+  gx <- as.character(sel_pairs[i, "geneX"]); gy <- as.character(sel_pairs[i, "geneY"])
+  symx <- gene_annot[gx, "symbol"]; symy <- gene_annot[gy, "symbol"]
+  mnxwt <- mean(gene_cpm[gx, group == "WT"]); mnywt <- mean(gene_cpm[gy, group == "WT"])
+  mnxloy <- mean(gene_cpm[gx, group == "LOY"]); mnyloy <- mean(gene_cpm[gy, group == "LOY"])
+  pairlogfc <- res.pair[pair_feature[i], "logFC"]
+  c(Pair = paste0(symy, "/", symx), YGene = symy, XHomolog = symx,
+    X_in_WT = mnxwt, Y_in_WT = mnywt, X_in_LOY = mnxloy, Y_in_LOY = mnyloy,
+    X_logFC = res[gx, "logFC"], X_FDR = res[gx, "adj.P.Val"],
+    Yfrac_WT = mnywt / (mnywt + mnxwt),
+    Compensation_efficiency = (mnxloy - mnxwt) / (mnywt - mnyloy),
+    Retained_dosage = (mnxloy + mnyloy) / (mnxwt + mnywt),
+    Pair_logFC = pairlogfc, Pair_FC = 2^pairlogfc,
+    Pair_FDR = res.pair[pair_feature[i], "adj.P.Val"])
+}))
+thetable <- xyhomologt2[order(as.numeric(xyhomologt2[, 9]), decreasing = TRUE), ]
+numeric.columns <- c("X_in_WT","Y_in_WT","X_in_LOY","Y_in_LOY","X_logFC",
+                     "X_FDR","Yfrac_WT","Compensation_efficiency",
+                     "Retained_dosage","Pair_logFC","Pair_FC","Pair_FDR")
+xyhomologt <- as.data.frame(xyhomologt2, stringsAsFactors = FALSE)
+xyhomologt[numeric.columns] <- lapply(xyhomologt[numeric.columns], as.numeric)
+pair.order <- as.character(xyhomologt$Pair[order(xyhomologt$Pair_logFC)])
+xyhomologt$Pair <- factor(xyhomologt$Pair, levels = pair.order)
+write.table(thetable, file.path(params$root_path, params$output_dir, "thetable.csv"), row.names = FALSE)
+```
+
+The dosage-composition chunk normalizes each homolog pair to its own WT X-plus-Y total and displays stacked WT and LOY contributions ordered by retained dosage.
+
+```{r xydosageplot}
+plotdat <- do.call(rbind, lapply(seq_len(nrow(xyhomologt)), function(i) {
+  wt.total <- sum(as.numeric(xyhomologt[i, c("X_in_WT", "Y_in_WT")]))
+  data.frame(
+    Pair = rep(xyhomologt[i, "Pair"], 4),
+    Condition = factor(c("WT", "WT", "LOY", "LOY"), levels = c("WT", "LOY")),
+    Homolog = factor(c("X", "Y", "X", "Y"), levels = c("X", "Y")),
+    Relative_expression = as.numeric(xyhomologt[i, c("X_in_WT", "Y_in_WT", "X_in_LOY", "Y_in_LOY")]) / wt.total
+  )
+}))
+rownames(plotdat) <- NULL
+pair.order <- xyhomologt$Pair[order(xyhomologt$Retained_dosage, decreasing = TRUE)]
+plotdat$Pair <- factor(plotdat$Pair, levels = pair.order)
+plotdat$Condition <- factor(plotdat$Condition, levels = c("WT", "LOY"))
+plotdat$Homolog <- factor(plotdat$Homolog, levels = c("Y", "X"))
+
+npairs <- dplyr::n_distinct(plotdat$Pair)
+homolog_colors <- c(X = "lightpink", Y = "#301934")
+
+plotdat$Homolog <- factor(plotdat$Homolog, levels = c("Y", "X"))
+p.dosage <- ggplot2::ggplot(
+  plotdat,
+  ggplot2::aes(Condition, Relative_expression, fill = Homolog)
+) +
+  ggplot2::geom_col(width = 0.7) +
+  ggplot2::geom_hline(yintercept = 1, linetype = "dashed") +
+  ggplot2::facet_wrap(~Pair, nrow = 1) +
+   ggplot2::scale_fill_manual(
+    values = homolog_colors,
+    breaks = c("Y", "X"),
+    drop = FALSE
+  ) +
+  ggplot2::scale_y_continuous(
+    breaks = c(0, 0.5, 1),
+    minor_breaks = NULL
+  ) +
+  ggplot2::labs(
+    x = NULL,
+    y = "Expression relative to WT X+Y total",
+    fill = NULL
+  ) +
+  ggplot2::theme_classic() +
+  ggplot2::theme(
+    legend.position = "top",
+    strip.background = ggplot2::element_blank(),
+    strip.text = ggplot2::element_text(face = "bold.italic", size = 12),
+    axis.text.x = ggplot2::element_text(size = 12)
+  )
+
+ggplot2::ggsave(
+  file.path(params$root_path, params$output_dir, "KG1a_xypair_dosage.pdf"),
+  p.dosage,
+  device = grDevices::cairo_pdf,
+  width = max(14, 2 * npairs),
+  height = 4.5,
+  units = "in",
+  limitsize = FALSE
+)
+
+ggplot2::ggsave(
+  file.path(params$root_path, params$output_dir, "xypair_dosage.png"),
+  p.dosage,
+  width = max(14, 2 * npairs),
+  height = 4.5,
+  units = "in",
+  dpi = 300,
+  limitsize = FALSE
+)
+
+p.dosage
+
+```
+
+<!-- annotate_rmd figure: source=xypair_dosage.pdf | match=explicit-output-template -->
+
+
+**Retained X-chromosome copies fail to compensate for lost Y-chromosome homologs in LOY cell lines.** Relative expression of X-Y homologous gene pairs in WT and LOY conditions is shown, normalized to the WT X+Y total for each pair. Stacked bars represent the contribution of X (teal) and Y (salmon) transcripts. The dashed line indicates the WT baseline (1.0). In LOY samples, the Y component is absent, and the X component does not consistently upregulate to maintain the WT total, indicating a lack of dosage compensation. The observed limited X-chromosome upregulation suggests that LOY leads to a net reduction in the expression of these specific gene pairs, which may contribute to the broader transcriptional changes observed in the cell-line model. 
+
+The transformation chunk assembles finite X-Y summary statistics and defines a signed pseudo-logarithmic scale that preserves zero while limiting visual domination by extreme compensation values.
+
+```{r outlier-visual-correction, results='hide'}
+library(scales)
+plotstats <- data.frame(
+  Pair = as.character(xyhomologt[, "Pair"]),
+  Yfrac_WT = as.numeric(xyhomologt[, "Yfrac_WT"]),
+  Compensation_efficiency = as.numeric(xyhomologt[, "Compensation_efficiency"]),
+  Retained_dosage = as.numeric(xyhomologt[, "Retained_dosage"])
+)
+outlier_scale <- pseudo_log_trans(base = 10, sigma = 0.1)
+```
+
+The compensation-scatter chunk relates each pair's baseline WT Y fraction to its X compensation efficiency, labels every finite pair, and saves the pseudo-log-scaled figure.
+
+```{r scatter}
+d.scatter <- plotstats[
+  is.finite(plotstats$Yfrac_WT) &
+  is.finite(plotstats$Compensation_efficiency),
+]
+p.scatter <- ggplot(d.scatter, aes(Yfrac_WT, Compensation_efficiency)) +
+  geom_hline(yintercept = 0) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  geom_point(size = 3) +
+  geom_text_repel(
+    aes(label = Pair),
+    seed = 173,
+    size = 2.5,
+    box.padding = 0.4,
+    point.padding = 0.3,
+    min.segment.length = 0,
+    max.overlaps = Inf,
+    show.legend = FALSE
+  ) +
+  scale_y_continuous(trans = outlier_scale) +
+  labs(x = "WT Y fraction: Y / (X + Y)", y = "Compensation efficiency") +
+  theme_classic()
+p.scatter
+ggsave(file.path(params$root_path, params$output_dir, "xypair_scatter.pdf"), device = cairo_pdf)
+```
+
+<!-- annotate_rmd figure: source=xypair_scatter.pdf | match=explicit-output-template -->
+
+
+**X-Y paralog compensation efficiency relative to wild-type Y-chromosome fraction.** Scatter plot showing the relationship between the wild-type Y-chromosome fraction (Y / (X + Y)) and the calculated compensation efficiency for selected X-Y paralog gene pairs. Each point represents a specific gene pair, labeled by gene symbol. The solid horizontal line indicates zero compensation efficiency, while the dashed line marks the theoretical limit of full compensation. The y-axis uses an outlier scale to accommodate extreme values. The data demonstrate that compensation efficiency varies widely among paralog pairs, with no consistent trend of X-chromosome upregulation corresponding to Y-chromosome loss. The lack of consistent positive compensation efficiency across X-Y paralog pairs suggests that retained X copies do not systematically upregulate to offset the loss of Y-linked genes in this model. 
+
+The compensation-lollipop chunk ranks finite X-Y pairs by compensation efficiency, displays signed deviations from zero on the same pseudo-log scale, and saves the horizontal plot.
+
+```{r llollipop}
+d.lollipop <- plotstats[
+  is.finite(plotstats$Compensation_efficiency),
+]
+d.lollipop$Pair <- factor(d.lollipop$Pair,
+                          levels = unique(d.lollipop$Pair[order(d.lollipop$Compensation_efficiency)]))
+p.lollipop <- ggplot(d.lollipop, aes(Pair, Compensation_efficiency)) +
+  geom_hline(yintercept = 0) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  geom_segment(aes(xend = Pair, y = 0, yend = Compensation_efficiency)) +
+  geom_point(size = 3) +
+  scale_y_continuous(trans = outlier_scale) +
+  coord_flip() +
+  labs(x = NULL, y = "Compensation efficiency") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 0.5))
+p.lollipop
+ggsave(file.path(params$root_path, params$output_dir, "xypair_comp_lol.pdf"))
+```
+
+<!-- annotate_rmd figure: source=xypair_comp_lol.pdf | match=explicit-output-template -->
+
+
+**Retained X-linked homologs fail to compensate for Y-chromosome loss in the LOY cell-line model.** Lollipop plot showing the compensation efficiency of X-Y paralog pairs in the isogenic LOY cell-line model. Compensation efficiency is calculated as the ratio of the change in X-linked expression to the change in Y-linked expression upon LOY. A value of 0 indicates no change in the X-linked homolog, while a value of 1 (dashed line) would indicate full compensation. Positive values indicate that the X-linked homolog does not upregulate sufficiently to compensate for the loss of the Y-linked gene. The TMSB4Y/TMSB4X pair shows a marked negative efficiency, indicating downregulation of the retained X homolog. The limited transcriptional compensation for X-Y homolog pairs suggests that LOY leads to a specific molecular imbalance in gene dosage.
+
+
+The retained-dosage chunk ranks X-Y pairs by the fraction of WT total dosage preserved in LOY and displays their signed deviations from complete retention on the pseudo-logarithmic scale.
+
+```{r retained-dosage}
+d.retained <- plotstats[
+  is.finite(plotstats$Retained_dosage),
+]
+d.retained$Dosage_change <- d.retained$Retained_dosage - 1
+d.retained$Pair <- factor(d.retained$Pair,
+                          levels = d.retained$Pair[order(d.retained$Retained_dosage)])
+retained_breaks <- c(-1, -0.75, -0.50, -0.25, 0, 0.25, 0.50, 1)
+p.retained <- ggplot(d.retained, aes(Pair, Dosage_change)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_segment(aes(xend = Pair, y = 0, yend = Dosage_change)) +
+  geom_point(size = 3) +
+  scale_y_continuous(
+    trans = outlier_scale,
+    breaks = retained_breaks,
+    labels = retained_breaks + 1
+  ) +
+  coord_flip() +
+  labs(x = NULL, y = "Fraction of WT X+Y dosage retained") +
+  theme_classic()
+p.retained
+invisible(file.path(params$root_path, params$output_dir, "xypair_retained_lol.pdf"))
+```
+```{r pathway-ora-setup, results='hide'}
+suppressPackageStartupMessages({
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(ReactomePA)
+  library(enrichplot)
+  library(dplyr)
+})
+ensembl_id <- if ("ensembl_gene_id_unversioned" %in% names(res)) {
+  res$ensembl_gene_id_unversioned
+} else if ("ensembl_gene_id" %in% names(res)) {
+  res$ensembl_gene_id
+} else {
+  rownames(res)
+}
+
+ora_df <- res |>
+  dplyr::mutate(
+    ENSEMBL = sub("\\.[0-9]+$", "", as.character(ensembl_id)),
+    Direction = dplyr::case_when(
+      adj.P.Val <= 0.05 & logFC >= 1  ~ "Up",
+      adj.P.Val <= 0.05 & logFC <= -1 ~ "Down",
+      TRUE                            ~ NA_character_
+    )
+  ) |>
+  dplyr::filter(!is.na(ENSEMBL), ENSEMBL != "")
+
+id_map <- clusterProfiler::bitr(
+  unique(ora_df$ENSEMBL),
+  fromType = "ENSEMBL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db::org.Hs.eg.db
+) |>
+  dplyr::distinct(ENSEMBL, ENTREZID)
+
+ora_df <- dplyr::inner_join(ora_df, id_map, by = "ENSEMBL")
+universe_entrez <- unique(id_map$ENTREZID)## Analyze significant upregulated and downregulated genes separately.
+keep <- !is.na(ora_df$Direction) & !is.na(ora_df$ENTREZID)
+
+de_entrez <- split(
+  as.character(ora_df$ENTREZID[keep]),
+  ora_df$Direction[keep]
+)
+
+de_entrez <- lapply(de_entrez, unique)
+de_entrez <- de_entrez[lengths(de_entrez) >= 5]
+
+if (!length(de_entrez)) {
+  stop("No sufficiently large mapped DE-gene sets were available for ORA.")
+}
+
+## Compact export and plotting helper shared by KEGG and Reactome.
+save_ora <- function(x, stem, title) {
+  tab <- as.data.frame(x)
+
+  write.csv(
+    tab,
+    file.path(
+      params$root_path,
+      params$output_dir,
+      paste0(stem, ".csv")
+    ),
+    row.names = FALSE
+  )
+
+  if (!nrow(tab)) {
+    message("No significant ", title, " terms were detected.")
+    return(tab)
+  }
+
+  p <- enrichplot::dotplot(
+    x,
+    showCategory = 8,
+    includeAll = FALSE,
+    label_format = 42,
+    font.size = 12,
+    title = title
+  ) +
+    labs(x = NULL, y = NULL) +
+    theme(
+      plot.title = element_text(
+        hjust = 0.5,
+        face = "bold",
+        size = 13
+      ),
+      axis.text.y = element_text(size = 12)
+    )
+
+  print(p)
+
+  ggsave(
+    file.path(
+      params$root_path,
+      params$output_dir,
+      paste0(stem, ".pdf")
+    ),
+    plot = p,
+    device = cairo_pdf,
+    width = 10.5,
+    height = 7.2
+  )
+
+  tab
+}
+print(p)
+```
+
+The dot plot's `label_format` argument wraps long pathway names, which should prevent the text from extending excessively across the figure. :contentReference[oaicite:3]{index=3}
+
+## Standard KEGG enrichment chunk
+
+**Purpose:** Test whether conventional KEGG pathways are over-represented among significant upregulated and downregulated genes.
+
+**Input:** `de_entrez` and `universe_entrez` from the shared setup.
+
+**Output:** `kegg_ora`, `kegg_table`, `kegg_ORA_LOY_vs_WT.csv`, and `kegg_ORA_LOY_vs_WT.pdf`.
+
+**Author:** Koray Dogan Kaya.
+
+```{r kegg-ora, fig.width=10.5, fig.height=7.2}
+kegg_ora <- clusterProfiler::compareCluster(
+  geneClusters = de_entrez,
+  fun = "enrichKEGG",
+  organism = "hsa",
+  keyType = "ncbi-geneid",
+  universe = universe_entrez,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.20
+)
+
+kegg_table <- save_ora(
+  kegg_ora,
+  stem = "kegg_ORA_LOY_vs_WT",
+  title = "KEGG enrichment"
+)
+```
+```{r reactome-ora, fig.width=10.5, fig.height=7.2}
+reactome_ora <- clusterProfiler::compareCluster(
+  geneClusters = de_entrez,
+  fun = "enrichPathway",
+  organism = "human",
+  universe = universe_entrez,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.20,
+  readable = TRUE
+)
+
+reactome_table <- save_ora(
+  reactome_ora,
+  stem = "reactome_ORA_LOY_vs_WT",
+  title = "Reactome enrichment"
+)
+```
+
+```{r export-software-versions, include=FALSE}
+writeLines(capture.output(sessionInfo()),
+           file.path(params$root_path, params$output_dir, "sessionInfo.txt"))
+```

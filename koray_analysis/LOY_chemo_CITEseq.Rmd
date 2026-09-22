@@ -1,0 +1,1209 @@
+---
+title: "CITE-seq analysis of loss of Y and chemotherapy response in a mouse AML model"
+author: "Koray Dogan Kaya"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    df_print: paged
+  pdf_document:
+    toc: true
+params:
+  p1_cellranger_dir: data/mouse/CITEseq_P1
+  p2_cellranger_dir: data/mouse/CITEseq_P2
+  feature_reference_file: data/mouse/totalseq_b_mouse_feature_reference.csv
+  reference_dir: data/mouse/GRCm39_GENCODE_M39
+  analysis_root: results/mouse
+  cellranger_version: 10.0.0
+  chemistry: Single Cell 3' v4 (CS1) OCM
+  organism: Mus musculus
+  genome_build: GRCm39
+  annotation_release: GENCODE M39
+  seed: 173
+---
+
+## Introduction
+
+This workflow analyzes eight mouse bone-marrow CITE-seq samples, comprising four Placebo and four Chemo recipients. RNA and antibody libraries are quality controlled jointly, while donor and host origin are assigned independently from reciprocal CD45.2 and CD45.1 ADT expression.
+
+Loss-of-Y status is evaluated only within strict CD45.2-positive donor cells. RNA-defined LOY-candidate cells have no detected transcript from the broad Y-gene panel represented in the Cell Ranger count matrix but retain detectable X-linked RNA; YINTACT cells have positive evidence from at least two trusted Y genes, and remaining cells are classified as Ambiguous. This treatment-blind rule is applied identically to all samples.
+
+Definitive LOY and YINTACT cells are aggregated into 16 raw-count pseudobulks, one state-specific library per mouse. TMM-voom models test state differences at baseline and after chemotherapy, treatment effects within each state, and the condition-by-state interaction. Because Placebo and Chemo are confounded with processing pool, between-condition results are interpreted as exploratory.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE, message = FALSE, warning = FALSE, collapse = TRUE,
+  comment = "#>", fig.align = "center", fig.width = 7, fig.height = 5,
+  out.width = "100%", dpi = 300
+)
+options(stringsAsFactors = FALSE)
+set.seed(params$seed)
+```
+
+```{r required-libraries}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(SingleCellExperiment)
+  library(Matrix)
+  library(scDblFinder)
+  library(edgeR)
+  library(limma)
+  library(openxlsx)
+  library(clusterProfiler)
+  library(org.Mm.eg.db)
+  library(tibble)
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(ggplot2)
+  library(patchwork)
+  library(knitr)
+})
+```
+
+## Shared definitions and reproducibility helpers
+
+All experimental labels, color scales, typography, gene sets, file paths, and reusable functions are defined once here. Tables produced throughout the workflow are registered for a single review workbook, whose index records the source chunk, dimensions, and purpose of every sheet and external file.
+
+```{r project-configuration}
+condition_levels <- c("Placebo", "Chemo")
+sample_levels <- paste0("S", 1:8)
+sample_design <- tibble(
+  sample_id = sample_levels,
+  condition = factor(rep(condition_levels, each = 4), levels = condition_levels),
+  pool = factor(rep(c("P1", "P2"), each = 4), levels = c("P1", "P2")),
+  gem_color = rep(c("Blue", "Red", "Green", "Yellow"), 2),
+  ocm_tag = rep(c("OB1", "OB2", "OB4", "OB3"), 2)
+)
+cellranger_runs <- c(P1 = params$p1_cellranger_dir, P2 = params$p2_cellranger_dir)
+sex_map <- c(S1 = "Female", S2 = "Female", S3 = "Male", S4 = "Female",
+             S5 = "Female", S6 = "Female", S7 = "Male", S8 = "Male")
+female_samples <- names(sex_map)[sex_map == "Female"]
+male_samples <- names(sex_map)[sex_map == "Male"]
+
+analysis_paths <- setNames(
+  file.path(params$analysis_root, c("figures", "tables", "objects")),
+  c("figures", "tables", "objects")
+)
+invisible(lapply(analysis_paths, dir.create, recursive = TRUE, showWarnings = FALSE))
+fnm2 <- function(dir, file) file.path(analysis_paths[[dir]], file)
+
+pal <- list(
+  condition = c(Placebo = "#0072B2", Chemo = "#D55E00"),
+  cd45 = c("Host CD45.1+" = "#0072B2", "Donor CD45.2+" = "#D55E00", Ambiguous = "#BDBDBD"),
+  sex = c(Male = "#0072B2", Female = "#CC79A7"),
+  state = c("LOY-candidate" = "#DD0000", YINTACT = "#0000FF", Ambiguous = "#BDBDBD"),
+  pseudobulk = c(LOY = "#D55E00", YINTACT = "#0072B2"),
+  yx_sum = c("Host Y background" = "#0072B2", "Donor Y sum" = "#D55E00", "Donor X sum" = "#009E73")
+)
+font <- list(base = 8, title = 11, subtitle = 9, axis = 8, strip = 9, legend = 8, tag = 11)
+theme_nature <- function(base_size = font$base, grid = FALSE) {
+  th <- theme_classic(base_size = base_size, base_family = "sans") +
+    theme(
+      plot.title = element_text(size = font$title, face = "bold", hjust = 0),
+      plot.subtitle = element_text(size = font$subtitle),
+      axis.title = element_text(size = font$axis),
+      axis.text = element_text(size = font$axis, color = "black"),
+      strip.text = element_text(size = font$strip, face = "bold"),
+      legend.title = element_text(size = font$legend),
+      legend.text = element_text(size = font$legend),
+      plot.tag = element_text(size = font$tag, face = "bold"),
+      panel.spacing = grid::unit(.6, "lines")
+    )
+  if (grid) th + theme(panel.grid.major.y = element_line(color = "grey90", linewidth = .3)) else th
+}
+
+cd45_population_levels <- c("Host CD45.1+", "Donor CD45.2+", "Ambiguous")
+yx_pairs <- c(Eif2s3y = "Eif2s3x", Kdm5d = "Kdm5c", Uty = "Kdm6a")
+loy_y_genes <- names(yx_pairs)
+loy_x_genes <- unname(yx_pairs)
+classifier_genes <- c(loy_y_genes, loy_x_genes)
+loy_state_levels <- c("LOY-candidate", "YINTACT", "Ambiguous")
+loy_min_x_genes <- 1L
+adt_markers <- c("CD45.1", "CD45.2", "CD117", "CD4", "CD8a")
+origin_levels <- c("Host CD45.1+", "Donor CD45.2+")
+
+review <- new.env(parent = emptyenv())
+review$sheets <- list()
+review$index <- tibble(
+  kind = character(), name = character(), source_chunk = character(),
+  description = character(), rows = integer(), columns = integer(), location = character()
+)
+clean_sheet_name <- function(x) substr(gsub("[^A-Za-z0-9_ ]", "_", x), 1, 31)
+register_sheet <- function(name, x, source_chunk, description) {
+  name <- clean_sheet_name(name)
+  if (inherits(x, "Matrix")) x <- as.matrix(x)
+  if (is.matrix(x)) x <- as.data.frame(x, check.names = FALSE)
+  if (!is.data.frame(x)) x <- as.data.frame(x)
+  review$sheets[[name]] <- x
+  review$index <- review$index |>
+    filter(!(kind == "sheet" & location == name)) |>
+    add_row(kind = "sheet", name = name, source_chunk = source_chunk,
+            description = description, rows = nrow(x), columns = ncol(x), location = name)
+  invisible(x)
+}
+register_file <- function(name, path, source_chunk, description) {
+  review$index <- review$index |>
+    filter(!(kind == "file" & location == path)) |>
+    add_row(kind = "file", name = name, source_chunk = source_chunk,
+            description = description, rows = NA_integer_, columns = NA_integer_, location = path)
+  invisible(path)
+}
+matrix_df <- function(x, row_name = "gene")
+  tibble::rownames_to_column(as.data.frame(as.matrix(x), check.names = FALSE), row_name)
+cell_matrix_df <- function(x, row_name = "cell")
+  tibble::rownames_to_column(as.data.frame(t(as.matrix(x)), check.names = FALSE), row_name)
+cell_df <- function(object) tibble::rownames_to_column(object[[]], "cell")
+
+save_fig <- function(plot, number, width = NULL, height = NULL, bg = "white") {
+  width <- if (is.null(width)) knitr::opts_current$get("fig.width") else width
+  height <- if (is.null(height)) knitr::opts_current$get("fig.height") else height
+  if (is.null(width)) width <- 7
+  if (is.null(height)) height <- 5
+  stem <- sprintf("fig%02d", number)
+  paths <- c(pdf = fnm2("figures", paste0(stem, ".pdf")), png = fnm2("figures", paste0(stem, ".png")))
+  ggsave(paths[["pdf"]], plot, width = width, height = height, units = "in", limitsize = FALSE, bg = bg)
+  ggsave(paths[["png"]], plot, width = width, height = height, units = "in",
+         dpi = knitr::opts_current$get("dpi"), limitsize = FALSE, bg = bg)
+  register_file(stem, paths[["pdf"]], knitr::opts_current$get("label"), "Publication figure in PDF format")
+  register_file(stem, paths[["png"]], knitr::opts_current$get("label"), "Publication figure in PNG format")
+  invisible(paths)
+}
+
+make_qc_figure <- function(object) {
+  qc <- object[[]]
+  long <- qc |>
+    transmute(sample_id,
+      `Genes per UMI` = genes_per_umi, `RNA UMIs` = nCount_RNA,
+      `RNA features` = nFeature_RNA, `log10 ADT UMIs` = log10(nCount_ADT + 1),
+      `Mitochondrial (%)` = percent.mt, `Ribosomal (%)` = percent.ribo
+    ) |>
+    pivot_longer(-sample_id, names_to = "metric", values_to = "value")
+  violin <- function(metrics) long |>
+    filter(metric %in% metrics) |>
+    ggplot(aes(sample_id, value, fill = sample_id)) +
+    geom_violin(scale = "width", trim = TRUE, linewidth = .2) +
+    facet_wrap(~metric, scales = "free_y") +
+    scale_fill_viridis_d(end = .9) + guides(fill = "none") +
+    theme_nature() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  p1 <- violin(c("Genes per UMI", "RNA UMIs", "RNA features"))
+  p2 <- violin(c("log10 ADT UMIs", "Mitochondrial (%)", "Ribosomal (%)"))
+  p3 <- ggplot(qc, aes(nCount_RNA, nFeature_RNA, color = percent.mt)) +
+    geom_point(size = .2, alpha = .4) + facet_wrap(~sample_id, scales = "free", ncol = 4) +
+    scale_color_viridis_c() + labs(x = "RNA UMIs", y = "Detected RNA features", color = "Mitochondrial (%)") +
+    theme_nature()
+  p4 <- ggplot(qc, aes(nCount_RNA + 1, nCount_ADT + 1)) +
+    geom_point(size = .2, alpha = .4) + facet_wrap(~sample_id, scales = "free", ncol = 4) +
+    scale_x_log10() + scale_y_log10() + labs(x = "RNA UMIs", y = "ADT UMIs") + theme_nature()
+  (p1 | p2) / (p3 | p4) + plot_annotation(tag_levels = "A")
+}
+
+register_sheet("Parameters", tibble(parameter = names(params), value = vapply(params, as.character, character(1))),
+               "project-configuration", "R Markdown parameters used for the analysis")
+register_sheet("Sample_design", sample_design, "project-configuration",
+               "Sample, treatment, processing-pool, GEM-color, and OCM-tag assignments")
+sample_design
+```
+
+## Data import and feature audit
+
+### Sequenced feature inventory
+
+Aggregate Cell Ranger matrices from both processing pools are located and summarized before sample-level import. RNA and ADT detection inventories are retained in the review workbook together with the antibody feature-reference table.
+
+```{r available-sequenced-features}
+locate_filtered_h5 <- function(run) {
+  preferred <- c(
+    file.path(run, "outs", "multi", "count", "filtered_feature_bc_matrix.h5"),
+    file.path(run, "multi", "count", "filtered_feature_bc_matrix.h5"),
+    file.path(run, "outs", "filtered_feature_bc_matrix.h5"),
+    file.path(run, "filtered_feature_bc_matrix.h5")
+  )
+  hit <- preferred[file.exists(preferred)]
+  if (length(hit)) return(hit[1])
+  hit <- list.files(run, "filtered_feature_bc_matrix\\.h5$", recursive = TRUE, full.names = TRUE)
+  hit <- hit[!grepl("per_sample_outs|sample_filtered", hit)]
+  if (length(hit) != 1) stop("Could not identify one aggregate filtered H5 under ", run)
+  hit
+}
+summarize_matrix <- function(x, pool) tibble(
+  pool, feature = rownames(x), total_umis = as.numeric(Matrix::rowSums(x)),
+  cells_detected = as.integer(Matrix::rowSums(x > 0)),
+  detection_fraction = as.numeric(Matrix::rowSums(x > 0) / ncol(x))
+)
+summarize_pool <- function(file, pool) {
+  x <- Read10X_h5(file, use.names = TRUE, unique.features = TRUE)
+  list(RNA = summarize_matrix(x[["Gene Expression"]], pool),
+       ADT = summarize_matrix(x[["Antibody Capture"]], pool))
+}
+prefix_pool <- function(x, pool) x |>
+  select(-pool) |>
+  rename_with(~paste0(pool, "_", .x), -feature)
+
+pool_features <- setNames(lapply(names(cellranger_runs), function(pool)
+  summarize_pool(locate_filtered_h5(cellranger_runs[[pool]]), pool)), names(cellranger_runs))
+adt_inventory <- full_join(prefix_pool(pool_features$P1$ADT, "P1"),
+                           prefix_pool(pool_features$P2$ADT, "P2"), by = "feature") |>
+  mutate(present_P1 = !is.na(P1_total_umis), present_P2 = !is.na(P2_total_umis),
+         across(matches("total_umis|cells_detected|detection_fraction"), ~replace_na(.x, 0)))
+rna_inventory <- full_join(prefix_pool(pool_features$P1$RNA, "P1"),
+                           prefix_pool(pool_features$P2$RNA, "P2"), by = "feature") |>
+  mutate(across(matches("total_umis|cells_detected|detection_fraction"), ~replace_na(.x, 0)),
+         detected_any_pool = P1_total_umis > 0 | P2_total_umis > 0)
+feature_reference <- read.csv(params$feature_reference_file, check.names = FALSE)
+reference_labels <- unique(c(if ("id" %in% names(feature_reference)) feature_reference$id,
+                             if ("name" %in% names(feature_reference)) feature_reference$name))
+adt_inventory <- adt_inventory |>
+  mutate(listed_in_feature_reference = feature %in% reference_labels) |>
+  arrange(feature)
+rna_inventory <- arrange(rna_inventory, feature)
+register_sheet("Feature_ADT", adt_inventory, "available-sequenced-features", "ADT feature detection by Cell Ranger pool")
+register_sheet("Feature_RNA", rna_inventory, "available-sequenced-features", "RNA feature detection by Cell Ranger pool")
+register_sheet("Feature_reference", feature_reference, "available-sequenced-features", "Antibody feature-reference file used by Cell Ranger")
+cat("Antibody features:", nrow(adt_inventory),
+    "\nRNA features:", nrow(rna_inventory),
+    "\nRNA features detected:", sum(rna_inventory$detected_any_pool), "\n")
+kable(adt_inventory, digits = 4, caption = "Sequenced antibody features across P1 and P2.")
+```
+
+### Sample-level matrices
+
+Each sample-specific filtered H5 is converted to a Seurat object, annotated from the experimental design, and merged while preserving separate RNA and ADT assays.
+
+```{r import-samples}
+run_dirs <- unname(cellranger_runs[as.character(sample_design$pool)])
+outs_dirs <- ifelse(dir.exists(file.path(run_dirs, "outs")), file.path(run_dirs, "outs"), run_dirs)
+sample_files <- setNames(file.path(outs_dirs, "per_sample_outs", sample_levels,
+                                   "sample_filtered_feature_bc_matrix.h5"), sample_levels)
+if (any(!file.exists(sample_files))) stop("Missing sample H5 files: ", paste(names(sample_files)[!file.exists(sample_files)], collapse = ", "))
+
+read_sample <- function(id) {
+  x <- Read10X_h5(sample_files[[id]])
+  design <- sample_design[match(id, sample_design$sample_id), ]
+  object <- CreateSeuratObject(x[["Gene Expression"]], project = id, min.cells = 0, min.features = 0)
+  object[["ADT"]] <- CreateAssay5Object(x[["Antibody Capture"]])
+  object$sample_id <- design$sample_id
+  object$condition <- design$condition
+  object$pool <- design$pool
+  object$gem_color <- design$gem_color
+  object$ocm_tag <- design$ocm_tag
+  object
+}
+
+sample_objects <- setNames(lapply(sample_levels, read_sample), sample_levels)
+cite_obj <- merge(sample_objects[[1]], y = sample_objects[-1],
+                  add.cell.ids = names(sample_objects), merge.data = FALSE)
+cite_obj <- JoinLayers(cite_obj, assay = "RNA")
+cite_obj <- JoinLayers(cite_obj, assay = "ADT")
+import_summary <- cite_obj[[]] |>
+  count(sample_id, condition, pool, gem_color, ocm_tag, name = "cells")
+register_sheet("Import_summary", import_summary, "import-samples", "Cell Ranger-assigned cells imported for each mouse")
+register_sheet("Sample_files", tibble(sample_id = names(sample_files), h5_file = unname(sample_files)),
+               "import-samples", "Sample-specific Cell Ranger H5 input files")
+kable(import_summary, caption = "Cell Ranger-assigned cells imported for each mouse.")
+```
+
+## Cell-level quality control
+
+### Pre-filter quality distributions
+
+RNA complexity, ADT abundance, mitochondrial content, and ribosomal content are displayed before additional filtering to document the initial Cell Ranger-assigned population.
+
+```{r prefilter-qc, fig.width=14, fig.height=11}
+cite_obj$percent.mt <- PercentageFeatureSet(cite_obj, pattern = "^(mt-|MT-)")
+cite_obj$percent.ribo <- PercentageFeatureSet(cite_obj, pattern = "^Rp[sl]")
+cite_obj$genes_per_umi <- log10(cite_obj$nFeature_RNA + 1) / log10(cite_obj$nCount_RNA + 1)
+fig01 <- make_qc_figure(cite_obj)
+save_fig(fig01, 1)
+fig01
+```
+
+**Figure 1 | Pre-filter RNA and ADT quality assessment.** RNA complexity, RNA and ADT library sizes, mitochondrial and ribosomal fractions, and RNA-ADT relationships are shown for all eight samples before additional filtering.
+
+### Removal of zero-count entries
+
+Cells and RNA features with zero total counts are removed before sample-specific outlier filtering.
+
+```{r remove-zero-rna}
+rna <- LayerData(cite_obj, assay = "RNA", layer = "counts")
+keep_cells <- Matrix::colSums(rna) > 0
+keep_genes <- Matrix::rowSums(rna) > 0
+cite_obj <- subset(cite_obj, cells = colnames(rna)[keep_cells])
+cite_obj[["RNA"]] <- subset(cite_obj[["RNA"]], features = rownames(rna)[keep_genes])
+zero_summary <- tibble(
+  zero_RNA_cells_removed = sum(!keep_cells), zero_RNA_genes_removed = sum(!keep_genes),
+  remaining_cells = ncol(cite_obj), remaining_RNA_genes = nrow(cite_obj[["RNA"]])
+)
+register_sheet("QC_zero_counts", zero_summary, "remove-zero-rna", "Removal of cells and genes with zero RNA counts")
+kable(zero_summary, caption = "Removal of zero-count RNA cells and features.")
+```
+
+### Sample-specific RNA filtering
+
+Low RNA counts, low detected-feature counts, and high mitochondrial fractions are identified within each sample using three-MAD outlier rules.
+
+```{r basic-qc-filter}
+cite_obj$low_RNA <- scuttle::isOutlier(cite_obj$nCount_RNA, type = "lower", log = TRUE,
+                                       batch = cite_obj$sample_id, nmads = 3)
+cite_obj$low_features <- scuttle::isOutlier(cite_obj$nFeature_RNA, type = "lower", log = TRUE,
+                                            batch = cite_obj$sample_id, nmads = 3)
+cite_obj$high_mito <- scuttle::isOutlier(cite_obj$percent.mt, type = "higher",
+                                         batch = cite_obj$sample_id, nmads = 3, min.diff = 5)
+cite_obj$qc_keep <- with(cite_obj[[]], !low_RNA & !low_features & !high_mito)
+filter_summary <- cite_obj[[]] |>
+  group_by(sample_id) |>
+  summarise(before = n(), removed = sum(!qc_keep), retained = sum(qc_keep),
+            retained_percent = 100 * mean(qc_keep), .groups = "drop")
+cite_qc <- subset(cite_obj, cells = colnames(cite_obj)[cite_obj$qc_keep])
+register_sheet("QC_filter", filter_summary, "basic-qc-filter", "Sample-specific RNA QC filtering")
+kable(filter_summary, digits = 1, caption = "Sample-specific RNA quality-control filtering.")
+```
+
+### Doublet detection
+
+scDblFinder is run by processing pool, and predicted doublets are removed before RNA and ADT normalization.
+
+```{r doublet-detection, fig.width=8, fig.height=4}
+sce <- scDblFinder(
+  as.SingleCellExperiment(cite_qc, assay = "RNA"), samples = "pool", clusters = FALSE,
+  BPPARAM = BiocParallel::SerialParam(RNGseed = params$seed)
+)
+cite_qc$doublet_score <- sce$scDblFinder.score
+cite_qc$doublet_class <- sce$scDblFinder.class
+doublet_summary <- cite_qc[[]] |>
+  group_by(sample_id, pool) |>
+  summarise(cells = n(), doublets = sum(doublet_class == "doublet"),
+            doublet_percent = 100 * mean(doublet_class == "doublet"), .groups = "drop")
+cite_clean <- subset(cite_qc, subset = doublet_class == "singlet")
+register_sheet("QC_doublets", doublet_summary, "doublet-detection", "scDblFinder classifications by sample and pool")
+kable(doublet_summary, digits = 1, caption = "scDblFinder doublet calls by mouse.")
+fig02 <- ggplot(cite_qc[[]], aes(doublet_score, fill = doublet_class)) +
+  geom_histogram(bins = 50) + facet_wrap(~pool, scales = "free_y") +
+  labs(x = "scDblFinder score", y = "Cells", fill = "Classification") +
+  theme_nature(grid = TRUE)
+save_fig(fig02, 2)
+fig02
+```
+
+**Figure 2 | Pool-specific doublet detection.** scDblFinder score distributions are shown for P1 and P2; `r sum(doublet_summary$doublets)` predicted doublets were excluded before normalization.
+
+### RNA and ADT normalization
+
+RNA counts are log-normalized and used to select 3,000 variable features. ADTs are normalized by cell-wise CLR transformation, and the raw and normalized assay layers are retained for subsequent analysis and export.
+
+```{r normalization}
+cite_clean <- cite_clean |>
+  NormalizeData(assay = "RNA", normalization.method = "LogNormalize", scale.factor = 1e4, verbose = FALSE) |>
+  FindVariableFeatures(assay = "RNA", selection.method = "vst", nfeatures = 3000, verbose = FALSE)
+cite_clean <- NormalizeData(cite_clean, assay = "ADT", normalization.method = "CLR", margin = 2, verbose = FALSE)
+DefaultAssay(cite_clean) <- "RNA"
+rna_counts <- LayerData(cite_clean, assay = "RNA", layer = "counts")
+rna_data <- LayerData(cite_clean, assay = "RNA", layer = "data")
+adt_counts <- LayerData(cite_clean, assay = "ADT", layer = "counts")
+adt_clr <- LayerData(cite_clean, assay = "ADT", layer = "data")
+```
+
+### Post-filter quality distributions
+
+The pre-filter layout is repeated after RNA QC and doublet removal to document the retained singlet population used downstream.
+
+```{r postfilter-qc, fig.width=14, fig.height=11}
+fig03 <- make_qc_figure(cite_clean)
+save_fig(fig03, 3)
+fig03
+```
+
+**Figure 3 | Post-filter RNA and ADT quality assessment.** The same quality metrics shown in Figure 1 are summarized after sample-specific RNA filtering and removal of predicted doublets.
+
+## Antibody normalization and donor-host assignment
+
+### Normalized antibody distributions
+
+CLR-normalized expression of all ADT features is compared across samples before marker-based origin assignment. These distributions provide a global check for sample-wide shifts while retaining marker-specific positive tails.
+
+```{r adt-norm-eval, fig.width=10, fig.height=8}
+DefaultAssay(cite_clean) <- "ADT"
+adt_long <- FetchData(cite_clean, vars = rownames(cite_clean[["ADT"]]), layer = "data") |>
+  rownames_to_column("cell") |>
+  mutate(sample_id = factor(cite_clean$sample_id[match(cell, colnames(cite_clean))], levels = sample_levels)) |>
+  pivot_longer(-c(cell, sample_id), names_to = "antibody", values_to = "CLR")
+fig04 <- ggplot(adt_long, aes(sample_id, CLR, fill = sample_id)) +
+  geom_violin(scale = "width", trim = TRUE, linewidth = .2) +
+  facet_wrap(~antibody, ncol = 3, scales = "free_y") +
+  scale_fill_viridis_d(end = .9) + guides(fill = "none") +
+  labs(x = "Sample", y = "CLR-normalized ADT expression") +
+  theme_nature() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+save_fig(fig04, 4)
+fig04
+```
+
+**Figure 4 | CLR-normalized antibody distributions.** Cell-level expression of all antibody features is shown across S1-S8 after RNA QC and doublet removal.
+
+### Shared RNA embedding and CD45 marker evaluation
+
+A shared RNA-derived UMAP is calculated for all retained cells. Treatment occupancy, *Kit* RNA, selected ADTs, and CD45.1/CD45.2 density are displayed before a fixed reciprocal donor-host gate is applied.
+
+```{r cd45-gate, fig.width=14, fig.height=17}
+DefaultAssay(cite_clean) <- "RNA"
+cite_clean <- cite_clean |>
+  ScaleData(features = VariableFeatures(cite_clean), verbose = FALSE) |>
+  RunPCA(npcs = 50, verbose = FALSE) |>
+  RunUMAP(reduction = "pca", dims = 1:30, seed.use = params$seed, verbose = FALSE)
+
+umap_mat <- Embeddings(cite_clean, "umap")
+meta <- cite_clean[[]]
+umap_df <- tibble(
+  cell = rownames(umap_mat), UMAP_1 = unname(umap_mat[, 1]), UMAP_2 = unname(umap_mat[, 2]),
+  sample_id = factor(meta[rownames(umap_mat), "sample_id", drop = TRUE], levels = sample_levels),
+  condition = factor(meta[rownames(umap_mat), "condition", drop = TRUE], levels = condition_levels)
+)
+
+p_group <- ggplot(umap_df, aes(UMAP_1, UMAP_2, color = condition)) +
+  geom_point(size = .15, alpha = .6) + facet_wrap(~condition, nrow = 1) +
+  scale_color_manual(values = pal$condition) + coord_equal() + guides(color = "none") +
+  labs(x = "UMAP 1", y = "UMAP 2") + theme_nature()
+
+kit_df <- FetchData(cite_clean, vars = "Kit", layer = "data") |>
+  rownames_to_column("cell") |>
+  left_join(umap_df, by = "cell") |>
+  arrange(Kit)
+p_kit <- ggplot(kit_df, aes(UMAP_1, UMAP_2, color = Kit)) +
+  geom_point(size = .15) + facet_wrap(~condition, nrow = 1) +
+  scale_color_viridis_c(option = "magma") + coord_equal() +
+  labs(x = "UMAP 1", y = "UMAP 2", color = "Kit RNA") + theme_nature()
+
+DefaultAssay(cite_clean) <- "ADT"
+adt_df <- FetchData(cite_clean, vars = adt_markers, layer = "data") |>
+  rownames_to_column("cell") |>
+  left_join(select(umap_df, cell, UMAP_1, UMAP_2, sample_id, condition), by = "cell")
+p_markers <- adt_df |>
+  pivot_longer(all_of(adt_markers), names_to = "marker", values_to = "CLR") |>
+  arrange(condition, marker, CLR) |>
+  ggplot(aes(UMAP_1, UMAP_2, color = CLR)) +
+  geom_point(size = .12) + facet_grid(condition ~ marker) +
+  scale_color_viridis_c(option = "magma") + coord_equal() +
+  labs(x = "UMAP 1", y = "UMAP 2", color = "CLR") + theme_nature()
+
+p_gate <- ggplot(adt_df, aes(CD45.1, CD45.2)) +
+  geom_bin_2d(bins = 70) + facet_wrap(~sample_id, ncol = 4) +
+  scale_fill_viridis_c(trans = "log10") +
+  coord_cartesian(xlim = c(0, quantile(adt_df$CD45.1, .999, na.rm = TRUE)),
+                  ylim = c(0, quantile(adt_df$CD45.2, .999, na.rm = TRUE))) +
+  labs(x = "CD45.1 CLR expression", y = "CD45.2 CLR expression", fill = "Cells/bin") +
+  theme_nature()
+DefaultAssay(cite_clean) <- "RNA"
+
+fig05 <- (p_group / p_kit / p_markers / p_gate) +
+  plot_layout(heights = c(1.4, 1.4, 2.5, 1.8)) + plot_annotation(tag_levels = "A")
+register_sheet("UMAP_coordinates", umap_df, "cd45-gate", "Shared RNA UMAP coordinates and sample metadata")
+save_fig(fig05, 5)
+fig05
+```
+
+**Figure 5 | Shared RNA embedding and origin-marker distributions.** **A,** Placebo and Chemo cells on common RNA UMAP coordinates. **B,** *Kit* RNA expression. **C,** selected CLR-normalized ADTs. **D,** sample-specific CD45.1/CD45.2 density used to define the reciprocal gate.
+
+### Reciprocal CD45 population assignment
+
+Host and donor origin are assigned with one treatment-independent two-dimensional gate. Donor cells require CD45.2 CLR of at least 0.75 and a CD45.2-minus-CD45.1 margin of at least 0.35; host cells use the reciprocal criteria, and all other cells remain Ambiguous.
+
+```{r reciprocal-cd45-populations, fig.width=12, fig.height=7}
+positive_cut <- .75
+cd45_margin <- .35
+old_assay <- DefaultAssay(cite_clean)
+DefaultAssay(cite_clean) <- "ADT"
+cd45_gate_df <- FetchData(cite_clean, vars = c("CD45.1", "CD45.2"), layer = "data") |>
+  rownames_to_column("cell") |>
+  mutate(
+    sample_id = factor(cite_clean$sample_id[match(cell, colnames(cite_clean))], levels = sample_levels),
+    CD45_score = CD45.2 - CD45.1,
+    CD45_population = factor(case_when(
+      CD45.2 >= positive_cut & CD45_score >= cd45_margin ~ "Donor CD45.2+",
+      CD45.1 >= positive_cut & CD45_score <= -cd45_margin ~ "Host CD45.1+",
+      TRUE ~ "Ambiguous"
+    ), levels = cd45_population_levels)
+  )
+DefaultAssay(cite_clean) <- old_assay
+
+i <- match(colnames(cite_clean), cd45_gate_df$cell)
+if (anyNA(i)) stop("Not every Seurat cell could be matched to the CD45 table.")
+cite_clean$CD45_score <- cd45_gate_df$CD45_score[i]
+cite_clean$CD45_population <- factor(cd45_gate_df$CD45_population[i], levels = cd45_population_levels)
+cd45_gate_summary <- cd45_gate_df |>
+  count(sample_id, CD45_population, name = "cells") |>
+  group_by(sample_id) |>
+  mutate(percent = 100 * cells / sum(cells)) |>
+  ungroup()
+register_sheet("CD45_calls", cd45_gate_df, "reciprocal-cd45-populations", "Cell-level reciprocal CD45 origin assignments")
+register_sheet("CD45_summary", cd45_gate_summary, "reciprocal-cd45-populations", "CD45 origin counts and percentages by sample")
+kable(cd45_gate_summary, digits = 2, caption = "Reciprocal CD45 origin assignments.")
+
+fig06 <- ggplot(cd45_gate_df, aes(CD45.1, CD45.2, color = CD45_population)) +
+  geom_point(size = .18, alpha = .65) +
+  geom_abline(slope = 1, intercept = c(-cd45_margin, cd45_margin), linetype = 2, linewidth = .35) +
+  geom_vline(xintercept = positive_cut, linetype = 3, linewidth = .3) +
+  geom_hline(yintercept = positive_cut, linetype = 3, linewidth = .3) +
+  facet_wrap(~sample_id, ncol = 4) +
+  scale_color_manual(values = pal$cd45, drop = FALSE) +
+  labs(x = "CD45.1 CLR expression", y = "CD45.2 CLR expression", color = "Cell origin") +
+  theme_nature()
+save_fig(fig06, 6)
+fig06
+```
+
+**Figure 6 | Reciprocal CD45 donor-host assignment.** Cells are colored as strict host, strict donor, or Ambiguous using the fixed CD45.1/CD45.2 intensity and dominance thresholds shown by the dotted and diagonal lines.
+
+### Xist quality control
+
+Recipient sex is taken from experimental records. Raw *Xist* detection is summarized in all cells, strict host cells, and strict donor cells as a quality-control check only; it does not modify origin or LOY assignments.
+
+```{r xist-sex-by-sample, fig.width=12, fig.height=9}
+xist_pop_levels <- c("All cells", origin_levels)
+if (!"Xist" %in% rownames(rna_counts)) stop("Xist is absent from the RNA assay.")
+xist_df <- tibble(
+  cell = colnames(cite_clean),
+  sample_id = factor(as.character(cite_clean$sample_id), levels = sample_levels),
+  recipient_sex = factor(unname(sex_map[as.character(cite_clean$sample_id)]), levels = c("Male", "Female")),
+  CD45_population = as.character(cite_clean$CD45_population),
+  Xist_count = as.numeric(rna_counts["Xist", colnames(cite_clean), drop = FALSE])
+)
+if (anyNA(xist_df$recipient_sex)) stop("Recipient sex is missing for at least one sample.")
+cite_clean$recipient_sex <- xist_df$recipient_sex
+cite_clean$Xist_positive <- xist_df$Xist_count > 0
+xist_qc <- bind_rows(
+  mutate(xist_df, population = "All cells"),
+  xist_df |> filter(CD45_population %in% origin_levels) |> mutate(population = CD45_population)
+) |>
+  mutate(population = factor(population, levels = xist_pop_levels)) |>
+  group_by(sample_id, recipient_sex, population) |>
+  summarise(cells = n(), Xist_UMIs = sum(Xist_count), Xist_positive_cells = sum(Xist_count > 0),
+            Xist_positive_percent = 100 * mean(Xist_count > 0), .groups = "drop") |>
+  mutate(
+    expectation = case_when(
+      population == "Host CD45.1+" & recipient_sex == "Female" ~ "Expected",
+      population == "Donor CD45.2+" |
+        population == "Host CD45.1+" & recipient_sex == "Male" |
+        population == "All cells" & recipient_sex == "Male" ~ "Expected absent",
+      TRUE ~ "Not prespecified"
+    ),
+    qc_flag = case_when(
+      expectation == "Expected" & Xist_positive_cells == 0 ~ "Expected Xist not detected",
+      expectation == "Expected absent" & Xist_positive_cells > 0 ~ "Unexpected Xist detected",
+      TRUE ~ "Consistent"
+    ),
+    label = sprintf("%.1f%%\n%d/%d", Xist_positive_percent, Xist_positive_cells, cells)
+  )
+register_sheet("Xist_QC", xist_qc, "xist-sex-by-sample", "Raw Xist detection by sample, recipient sex, and CD45 origin")
+kable(xist_qc, digits = 2, caption = "Xist quality control using known recipient sex.")
+fig07 <- ggplot(xist_qc, aes(sample_id, Xist_positive_percent, fill = recipient_sex)) +
+  geom_col(width = .72) + geom_text(aes(label = label), vjust = -.25, size = 3.1) +
+  facet_wrap(~population, ncol = 1) + scale_fill_manual(values = pal$sex, drop = FALSE) +
+  scale_x_discrete(drop = FALSE) +
+  scale_y_continuous(limits = c(0, NA), expand = expansion(mult = c(0, .18))) +
+  expand_limits(y = 1) +
+  labs(title = "Xist quality control by sample and cell origin",
+       subtitle = "Expected in female host cells and absent from male recipients and male donor cells",
+       x = NULL, y = "Cells with at least one Xist UMI (%)", fill = "Recipient sex") +
+  theme_nature(grid = TRUE) + theme(legend.position = "bottom")
+save_fig(fig07, 7)
+fig07
+```
+
+**Figure 7 | Xist quality control.** Bars report the percentage and count of cells with at least one raw *Xist* UMI in all cells, strict host cells, and strict donor cells. Recipient sex is assigned from the study design rather than inferred from this figure.
+
+## Sex-chromosome annotation and LOY classification
+
+### X- and Y-linked genes in the Cell Ranger reference
+
+Chromosome assignments are read from the exact GRCm39/GENCODE M39 GTF used by Cell Ranger. Genes are retained only when they occur in the Seurat RNA assay, and detection summaries are calculated from raw UMIs.
+
+```{r chromosome-gene-sets}
+gtf_file <- c(file.path(params$reference_dir, "genes", "genes.gtf"),
+              file.path(params$reference_dir, "genes", "genes.gtf.gz"))
+gtf_file <- gtf_file[file.exists(gtf_file)][1]
+if (is.na(gtf_file)) stop("genes.gtf(.gz) not found in the Cell Ranger reference.")
+gtf <- rtracklayer::import(gtf_file) |>
+  as.data.frame() |>
+  filter(type == "gene", !is.na(gene_name), nzchar(gene_name)) |>
+  transmute(chromosome = as.character(seqnames), gene = as.character(gene_name))
+assay_genes <- rownames(cite_clean[["RNA"]])
+get_chr_genes <- function(chr) intersect(
+  unique(gtf$gene[gtf$chromosome %in% c(chr, paste0("chr", chr))]), assay_genes
+)
+get_detected_genes <- function(genes) genes[Matrix::rowSums(rna_counts[genes, , drop = FALSE]) > 0]
+all_y_genes <- get_chr_genes("Y")
+all_x_genes <- get_chr_genes("X")
+all_y_genes_detected <- get_detected_genes(all_y_genes)
+all_x_genes_detected <- get_detected_genes(all_x_genes)
+chromosome_gene_summary <- bind_rows(
+  tibble(chromosome = "Y", gene = all_y_genes),
+  tibble(chromosome = "X", gene = all_x_genes)
+) |>
+  mutate(total_UMI = Matrix::rowSums(rna_counts[gene, , drop = FALSE]),
+         cells_detected = Matrix::rowSums(rna_counts[gene, , drop = FALSE] > 0),
+         detected = total_UMI > 0) |>
+  arrange(chromosome, desc(cells_detected), gene)
+register_sheet("Chromosome_gene_sets", chromosome_gene_summary, "chromosome-gene-sets",
+               "X- and Y-linked genes from the Cell Ranger GTF with raw detection statistics")
+cat(length(all_y_genes), "Y genes in the count matrix;", length(all_y_genes_detected), "detected.\n",
+    length(all_x_genes), "X genes in the count matrix;", length(all_x_genes_detected), "detected.\n")
+```
+
+### Y-gene background in female-recipient samples
+
+The three trusted Y genes are compared between female CD45.1-positive host cells and male-derived CD45.2-positive donor cells. Rare host-cell Y counts provide an empirical view of ambient RNA, doublets, or origin misclassification.
+
+```{r y-gene-boxplots-female, fig.width=13, fig.height=10}
+y_box <- cell_matrix_df(rna_data[loy_y_genes, , drop = FALSE]) |>
+  left_join(cell_df(cite_clean) |> select(cell, sample_id, CD45_population), by = "cell") |>
+  filter(sample_id %in% female_samples, CD45_population %in% origin_levels) |>
+  pivot_longer(all_of(loy_y_genes), names_to = "gene", values_to = "expression") |>
+  mutate(sample_id = factor(sample_id, female_samples),
+         CD45_population = factor(CD45_population, origin_levels),
+         gene = factor(gene, loy_y_genes))
+y_ranges <- y_box |>
+  group_by(gene, sample_id, CD45_population) |>
+  summarise(cells = n(), detected_percent = 100 * mean(expression > 0),
+            min = min(expression), Q1 = quantile(expression, .25), median = median(expression),
+            Q3 = quantile(expression, .75), max = max(expression), .groups = "drop")
+register_sheet("Female_Y_ranges", y_ranges, "y-gene-boxplots-female",
+               "Trusted Y-gene expression ranges in female-recipient host and donor cells")
+kable(y_ranges, digits = 2, caption = "Y-gene expression in female-recipient host and donor cells.")
+fig08 <- ggplot(y_box, aes(sample_id, expression, fill = CD45_population)) +
+  geom_boxplot(width = .65, outlier.size = .25,
+               position = position_dodge2(.8, preserve = "single")) +
+  facet_wrap(~gene, ncol = 1, scales = "free_y") +
+  scale_fill_manual(values = pal$cd45[origin_levels], drop = FALSE) +
+  labs(title = "Y-linked expression in female-recipient samples",
+       subtitle = "Female host cells versus male-derived donor cells",
+       x = "Sample", y = "Log-normalized RNA expression", fill = "CD45 population") +
+  theme_nature(grid = TRUE) + theme(legend.position = "bottom")
+save_fig(fig08, 8)
+fig08
+```
+
+**Figure 8 | Y-gene background in female-recipient samples.** Log-normalized *Eif2s3y*, *Kdm5d*, and *Uty* distributions are compared between Y-negative host cells and male-derived donor cells in S1, S2, S4, S5, and S6.
+
+### Aggregate Y and X-counterpart signal
+
+Raw counts from the three trusted Y genes and their X counterparts are summed per cell and converted to log1p(CP10K). The plot contrasts female-host Y background with donor Y and donor X signal.
+
+```{r yx-sum-boxplots-female, fig.width=13, fig.height=6}
+female_origin_cells <- cell_df(cite_clean) |>
+  filter(sample_id %in% female_samples, CD45_population %in% origin_levels) |>
+  pull(cell)
+lib <- Matrix::colSums(rna_counts[, female_origin_cells, drop = FALSE])
+ys <- Matrix::colSums(rna_counts[loy_y_genes, female_origin_cells, drop = FALSE])
+xs <- Matrix::colSums(rna_counts[loy_x_genes, female_origin_cells, drop = FALSE])
+yx_cell <- tibble(
+  cell = female_origin_cells,
+  sample_id = as.character(cite_clean$sample_id[match(female_origin_cells, colnames(cite_clean))]),
+  population = as.character(cite_clean$CD45_population[match(female_origin_cells, colnames(cite_clean))]),
+  Y_UMI = as.numeric(ys), X_UMI = as.numeric(xs),
+  Y_sum = log1p(1e4 * ys / pmax(lib, 1)), X_sum = log1p(1e4 * xs / pmax(lib, 1))
+)
+yx_box <- bind_rows(
+  yx_cell |> filter(population == "Host CD45.1+") |>
+    transmute(cell, sample_id, series = "Host Y background", UMI = Y_UMI, expression = Y_sum),
+  yx_cell |> filter(population == "Donor CD45.2+") |>
+    transmute(cell, sample_id, series = "Donor Y sum", UMI = Y_UMI, expression = Y_sum),
+  yx_cell |> filter(population == "Donor CD45.2+") |>
+    transmute(cell, sample_id, series = "Donor X sum", UMI = X_UMI, expression = X_sum)
+) |>
+  mutate(sample_id = factor(sample_id, female_samples),
+         series = factor(series, levels = names(pal$yx_sum)))
+yx_ranges <- yx_box |>
+  group_by(sample_id, series) |>
+  summarise(cells = n(), detected_cells = sum(UMI > 0), detected_percent = 100 * mean(UMI > 0),
+            min = min(expression), Q1 = quantile(expression, .25), median = median(expression),
+            Q3 = quantile(expression, .75), max = max(expression), .groups = "drop")
+register_sheet("Female_YX_ranges", yx_ranges, "yx-sum-boxplots-female",
+               "Aggregate Y and X-counterpart expression in female-recipient samples")
+kable(yx_ranges, digits = 2, caption = "Aggregate Y and X-counterpart expression in female-recipient samples.")
+fig09 <- ggplot(yx_box, aes(sample_id, expression, fill = series)) +
+  geom_boxplot(width = .72, outlier.size = .3, outlier.alpha = .45,
+               position = position_dodge2(width = .85, preserve = "single")) +
+  scale_fill_manual(values = pal$yx_sum, drop = FALSE) +
+  labs(title = "Aggregate Y and X-counterpart expression",
+       subtitle = "Female host Y background versus male donor Y and X signals",
+       x = "Sample", y = "Aggregate log1p(CP10K)", fill = NULL) +
+  theme_nature(grid = TRUE) + theme(legend.position = "bottom")
+save_fig(fig09, 9)
+fig09
+```
+
+**Figure 9 | Aggregate Y and X-counterpart expression.** Female-host Y background is shown beside aggregate donor Y and donor X-counterpart expression for each female-recipient sample.
+
+### LOY and YINTACT classification
+
+The treatment-blind classifier is applied to every strict CD45.2-positive donor cell. A cell is LOY-candidate when no detected Y-linked gene is observed but at least one detected X-linked gene is present; YINTACT requires detection of at least two trusted Y genes. Conflicting or insufficient evidence remains Ambiguous.
+
+```{r loy-status}
+donor_cells <- colnames(cite_clean)[as.character(cite_clean$CD45_population) == "Donor CD45.2+"]
+y_panel <- intersect(all_y_genes_detected, rownames(rna_counts))
+x_panel <- intersect(all_x_genes_detected, rownames(rna_counts))
+trusted_y <- intersect(loy_y_genes, y_panel)
+if (!length(y_panel) || !length(x_panel) || length(trusted_y) < 2)
+  stop("Y/X panels or trusted Y genes are incomplete.")
+ym <- rna_counts[y_panel, donor_cells, drop = FALSE]
+xm <- rna_counts[x_panel, donor_cells, drop = FALSE]
+trusted_ym <- rna_counts[trusted_y, donor_cells, drop = FALSE]
+donor_meta <- cite_clean[[]][donor_cells, , drop = FALSE]
+calls <- tibble(
+  cell = donor_cells,
+  sample_id = as.character(donor_meta$sample_id),
+  condition = factor(as.character(donor_meta$condition), levels = condition_levels),
+  nCount_RNA = donor_meta$nCount_RNA,
+  nFeature_RNA = donor_meta$nFeature_RNA,
+  Y_UMI_all = as.numeric(Matrix::colSums(ym)),
+  X_UMI_all = as.numeric(Matrix::colSums(xm)),
+  Y_detected_all = Matrix::colSums(ym > 0),
+  Y_detected_trusted = Matrix::colSums(trusted_ym > 0),
+  X_detected_all = Matrix::colSums(xm > 0)
+) |>
+  mutate(
+    call_rule = case_when(
+      Y_detected_all == 0 & X_detected_all >= loy_min_x_genes ~ "No Y detected; X detected",
+      Y_detected_trusted >= 2 ~ "At least two trusted Y genes detected",
+      TRUE ~ "Intermediate or conflicting evidence"
+    ),
+    LOY_status = factor(case_when(
+      Y_detected_all == 0 & X_detected_all >= loy_min_x_genes ~ "LOY-candidate",
+      Y_detected_trusted >= 2 ~ "YINTACT",
+      TRUE ~ "Ambiguous"
+    ), levels = loy_state_levels)
+  )
+i <- match(colnames(cite_clean), calls$cell)
+
+loy_meta <- data.frame(
+  Y_detected_all = unname(calls$Y_detected_all[i]),
+  Y_detected_trusted = unname(calls$Y_detected_trusted[i]),
+  X_detected_all = unname(calls$X_detected_all[i]),
+  LOY_status = factor(
+    unname(as.character(calls$LOY_status[i])),
+    levels = loy_state_levels
+  ),
+  row.names = colnames(cite_clean)
+)
+
+cite_clean <- SeuratObject::AddMetaData(
+  cite_clean,
+  metadata = loy_meta
+)
+loy_retained <- calls |>
+  count(sample_id, LOY_status) |>
+  complete(sample_id = sample_levels, LOY_status = loy_state_levels, fill = list(n = 0)) |>
+  pivot_wider(names_from = LOY_status, values_from = n) |>
+  mutate(donor_total = `LOY-candidate` + YINTACT + Ambiguous,
+         retained = `LOY-candidate` + YINTACT,
+         retained_percent = 100 * retained / donor_total,
+         LOY_percent = 100 * `LOY-candidate` / retained)
+register_sheet("LOY_cell_calls", calls, "loy-status", "Cell-level RNA-defined LOY, YINTACT, and Ambiguous assignments")
+register_sheet("LOY_sample_summary", loy_retained, "loy-status", "Per-sample state counts, retention, and LOY percentage")
+kable(loy_retained, digits = 1, caption = "RNA-defined LOY and YINTACT calls among strict donor cells.")
+```
+
+### Spatial distribution of definitive Y states
+
+Definitive LOY-candidate and YINTACT donor cells are highlighted on the shared RNA UMAP. Grey cells provide the complete retained-cell background, while the same coordinates are shown by treatment and by mouse.
+
+```{r loy-yintact-shared-umap, fig.width=14, fig.height=11}
+loy_umap_df <- umap_df |>
+  left_join(select(calls, cell, LOY_status), by = "cell") |>
+  mutate(LOY_status = factor(as.character(LOY_status), levels = c("YINTACT", "LOY-candidate")))
+highlight_df <- loy_umap_df |>
+  filter(!is.na(LOY_status)) |>
+  arrange(LOY_status == "LOY-candidate")
+loy_umap <- function(split, ncol) ggplot(loy_umap_df, aes(UMAP_1, UMAP_2)) +
+  geom_point(color = "grey88", size = .08, alpha = .45) +
+  geom_point(data = highlight_df, aes(color = LOY_status), size = .18, alpha = .85) +
+  facet_wrap(reformulate(split), ncol = ncol) +
+  scale_color_manual(values = pal$state[c("YINTACT", "LOY-candidate")],
+                     labels = c(YINTACT = "YINTACT", `LOY-candidate` = "LOY"), drop = FALSE) +
+  coord_equal() + labs(x = "UMAP 1", y = "UMAP 2", color = "Y state") + theme_nature()
+p_condition <- loy_umap("condition", 2) + labs(title = "Definitive donor-cell Y states by treatment")
+p_sample <- loy_umap("sample_id", 4) + labs(title = "Definitive donor-cell Y states by sample")
+fig10 <- (p_condition / p_sample) + plot_layout(heights = c(1, 2), guides = "collect") +
+  plot_annotation(tag_levels = "A") & theme(legend.position = "bottom")
+register_sheet("LOY_UMAP", loy_umap_df, "loy-yintact-shared-umap",
+               "Shared UMAP coordinates with RNA-defined LOY status")
+save_fig(fig10, 10)
+fig10
+```
+
+**Figure 10 | Distribution of definitive Y states on the shared RNA UMAP.** LOY-candidate cells are shown in vermilion and YINTACT cells in blue, first by treatment and then separately for S1-S8; all other cells are grey.
+
+### Treatment comparison and classifier retention
+
+The complete donor-cell composition is reported before testing LOY among definitive calls. Quasibinomial models compare definitive-call retention and LOY fraction between Chemo and Placebo at the mouse level rather than treating individual cells as independent replicates.
+
+```{r loy-proportion-robustness, fig.width=12, fig.height=9}
+prop <- loy_retained |>
+  left_join(select(sample_design, sample_id, condition), by = "sample_id") |>
+  mutate(sample_id = factor(sample_id, sample_levels),
+         condition = factor(as.character(condition), condition_levels),
+         LOY = `LOY-candidate`, definitive = LOY + YINTACT,
+         LOY_percent = 100 * LOY / definitive,
+         retained_percent = 100 * retained / donor_total)
+fit_loy <- glm(cbind(LOY, YINTACT) ~ condition, quasibinomial(), prop)
+fit_retained <- glm(cbind(retained, Ambiguous) ~ condition, quasibinomial(), prop)
+model_prediction <- function(fit) {
+  nd <- data.frame(condition = factor(condition_levels, levels = condition_levels))
+  pr <- predict(fit, nd, type = "link", se.fit = TRUE)
+  mutate(nd, estimate = 100 * plogis(pr$fit),
+         lower = 100 * plogis(pr$fit - 1.96 * pr$se.fit),
+         upper = 100 * plogis(pr$fit + 1.96 * pr$se.fit))
+}
+pred_loy <- model_prediction(fit_loy)
+pred_retained <- model_prediction(fit_retained)
+model_tests <- tibble(
+  outcome = c("LOY among definitive cells", "Definitive-call retention"),
+  odds_ratio = exp(c(coef(fit_loy)[2], coef(fit_retained)[2])),
+  p_value = c(coef(summary(fit_loy))[2, 4], coef(summary(fit_retained))[2, 4])
+)
+composition <- prop |>
+  select(sample_id, condition, donor_total, LOY, YINTACT, Ambiguous) |>
+  pivot_longer(c(LOY, YINTACT, Ambiguous), names_to = "state", values_to = "cells") |>
+  mutate(percent = 100 * cells / donor_total,
+         state = factor(state, levels = c("Ambiguous", "YINTACT", "LOY")),
+         label = if_else(percent >= 5, sprintf("%.0f%%", percent), ""))
+p_composition <- ggplot(composition, aes(sample_id, percent, fill = state)) +
+  geom_col(width = .72) +
+  geom_text(aes(label = label), position = position_stack(vjust = .5), size = 3) +
+  facet_grid(~condition, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = c(Ambiguous = pal$state[["Ambiguous"]],
+                               YINTACT = pal$state[["YINTACT"]], LOY = pal$state[["LOY-candidate"]])) +
+  scale_y_continuous(breaks = seq(0, 100, 25), labels = function(x) paste0(x, "%"), limits = c(0, 100)) +
+  labs(title = "Classification of all strict CD45.2-positive donor cells",
+       x = NULL, y = "Donor cells (%)", fill = "RNA-defined state") +
+  theme_nature(grid = TRUE) + theme(legend.position = "bottom")
+metric_plot <- function(variable, prediction, title, subtitle) {
+  upper <- min(100, 5 * ceiling(1.15 * max(c(prop[[variable]], prediction$upper), na.rm = TRUE) / 5))
+  jitter <- position_jitter(width = .06, height = 0, seed = params$seed)
+  ggplot(prop, aes(condition, .data[[variable]], color = condition)) +
+    geom_point(position = jitter, size = 3) +
+    geom_text(aes(label = sample_id), position = jitter, vjust = -.8, size = 3, show.legend = FALSE) +
+    geom_errorbar(data = prediction, aes(x = condition, ymin = lower, ymax = upper),
+                  inherit.aes = FALSE, width = .08, linewidth = .6) +
+    geom_point(data = prediction, aes(x = condition, y = estimate), inherit.aes = FALSE, shape = 18, size = 4) +
+    scale_color_manual(values = pal$condition) +
+    scale_y_continuous(labels = function(x) paste0(x, "%"), limits = c(0, upper),
+                       expand = expansion(mult = c(.02, .12))) +
+    labs(title = title, subtitle = subtitle, x = NULL, y = NULL) +
+    guides(color = "none") + theme_nature(grid = TRUE)
+}
+p_retained <- metric_plot("retained_percent", pred_retained, "Definitive-call retention",
+  sprintf("Quasibinomial OR = %.2f, p = %.3g", model_tests$odds_ratio[2], model_tests$p_value[2])) +
+  labs(y = "LOY or YINTACT among donor cells (%)")
+p_loy <- metric_plot("LOY_percent", pred_loy, "LOY fraction among definitive calls",
+  sprintf("Quasibinomial OR = %.2f, p = %.3g", model_tests$odds_ratio[1], model_tests$p_value[1])) +
+  labs(y = "LOY among LOY + YINTACT (%)")
+fig11 <- p_composition / (p_retained | p_loy) +
+  plot_layout(heights = c(1, 1.15)) +
+  plot_annotation(title = "LOY classification and treatment comparison",
+                  subtitle = "Diamonds show quasibinomial estimates; error bars show 95% confidence intervals",
+                  tag_levels = "A")
+register_sheet("LOY_proportions", prop, "loy-proportion-robustness", "Sample-level LOY proportions and definitive-call retention")
+register_sheet("LOY_model_tests", model_tests, "loy-proportion-robustness", "Quasibinomial treatment tests")
+register_sheet("LOY_model_predictions", bind_rows(mutate(pred_loy, outcome = "LOY fraction"),
+                                                    mutate(pred_retained, outcome = "Retention")),
+               "loy-proportion-robustness", "Model-estimated group proportions and confidence intervals")
+save_fig(fig11, 11)
+fig11
+```
+
+**Figure 11 | LOY classification and treatment comparison.** **A,** Complete LOY, YINTACT, and Ambiguous composition of strict donor cells. **B,** Definitive-call retention did not differ detectably between treatments (OR `r sprintf('%.2f', model_tests$odds_ratio[2])`, *P* = `r signif(model_tests$p_value[2], 3)`). **C,** LOY fraction among definitive calls also showed no detectable treatment difference (OR `r sprintf('%.2f', model_tests$odds_ratio[1])`, *P* = `r signif(model_tests$p_value[1], 3)`).
+
+## Pseudobulk construction and classifier diagnostics
+
+### Sixteen paired state-specific pseudobulks
+
+Definitive donor cells are aggregated by mouse and Y state into 16 raw-count pseudobulks. The same matrix is converted to non-log TMM CPM and log2(CPM + 1) once, then reused for expression figures and downstream modeling.
+
+```{r make-16-pseudobulks}
+pb_cells <- calls |>
+  transmute(cell, state = recode(as.character(LOY_status),
+                                 `LOY-candidate` = "LOY", YINTACT = "YINTACT", .default = NA_character_)) |>
+  left_join(cell_df(cite_clean) |> select(cell, sample_id, condition, CD45_population), by = "cell") |>
+  filter(CD45_population == "Donor CD45.2+", !is.na(state)) |>
+  mutate(pb_id = paste(sample_id, state, sep = "_"))
+pb_coldata <- pb_cells |>
+  count(pb_id, sample_id, condition, state, name = "n_cells") |>
+  mutate(sample_id = factor(sample_id, sample_levels),
+         condition = factor(condition, condition_levels),
+         state = factor(state, levels = c("YINTACT", "LOY"))) |>
+  arrange(sample_id, state)
+if (nrow(pb_coldata) != 16 || any(table(pb_coldata$sample_id) != 2))
+  stop("Every sample must contain both LOY and YINTACT cells.")
+pb_cells$pb_id <- factor(pb_cells$pb_id, levels = pb_coldata$pb_id)
+membership <- Matrix::sparse.model.matrix(~0 + pb_id, pb_cells)
+pb_counts <- rna_counts[, pb_cells$cell, drop = FALSE] %*% membership
+colnames(pb_counts) <- as.character(pb_coldata$pb_id)
+pb_coldata$library_size <- as.numeric(Matrix::colSums(pb_counts))
+pb_dge_display <- calcNormFactors(DGEList(pb_counts))
+pb_tmm_cpm <- cpm(pb_dge_display, normalized.lib.sizes = TRUE, log = FALSE)
+pb_logcpm_display <- log2(pb_tmm_cpm + 1)
+pb_rds <- fnm2("objects", "LOY_YINTACT_16_pseudobulks.rds")
+saveRDS(list(counts = pb_counts, coldata = pb_coldata,
+             TMM_CPM = pb_tmm_cpm, log2_CPM1 = pb_logcpm_display), pb_rds)
+register_file("Pseudobulk object", pb_rds, "make-16-pseudobulks",
+              "Raw counts, metadata, TMM CPM, and display logCPM for 16 paired pseudobulks")
+register_sheet("PB_metadata", pb_coldata, "make-16-pseudobulks", "Pseudobulk sample metadata and contributing-cell counts")
+kable(pb_coldata, caption = "Sixteen paired LOY and YINTACT pseudobulk libraries.")
+```
+
+### Trusted Y/X expression across pseudobulks
+
+The three trusted Y genes and their X counterparts are plotted from the TMM-normalized pseudobulk matrix. The four panels separate LOY and YINTACT states while preserving one bar per mouse.
+
+```{r yx-bars-from-16-pseudobulks, fig.width=14, fig.height=15}
+if (!all(classifier_genes %in% rownames(pb_logcpm_display)))
+  stop("One or more trusted Y/X genes are absent from the pseudobulk matrix.")
+sample_order <- pb_coldata |>
+  distinct(sample_id, condition) |>
+  arrange(sample_id) |>
+  transmute(sample = paste(sample_id, condition, sep = " | ")) |>
+  pull(sample)
+yx_pb_plot <- matrix_df(t(pb_logcpm_display[classifier_genes, , drop = FALSE]), "pb_id") |>
+  left_join(pb_coldata, by = "pb_id") |>
+  pivot_longer(all_of(classifier_genes), names_to = "gene", values_to = "log2CPM") |>
+  mutate(sample = factor(paste(sample_id, condition, sep = " | "), levels = sample_order))
+ymax <- c(Y = max(1, 1.06 * max(yx_pb_plot$log2CPM[yx_pb_plot$gene %in% loy_y_genes])),
+          X = max(1, 1.06 * max(yx_pb_plot$log2CPM[yx_pb_plot$gene %in% loy_x_genes])))
+bar_panel <- function(state_value, genes, title, ymax, show_x = TRUE) {
+  p <- yx_pb_plot |>
+    filter(state == state_value, gene %in% genes) |>
+    mutate(gene = factor(gene, genes)) |>
+    ggplot(aes(sample, log2CPM)) +
+    geom_col(fill = pal$pseudobulk[[state_value]], width = .72) +
+    facet_wrap(~gene, nrow = 1) + coord_cartesian(ylim = c(0, ymax)) +
+    scale_x_discrete(drop = FALSE) +
+    labs(title = title, x = NULL, y = "Pseudobulk log2(CPM + 1)") +
+    theme_nature(grid = TRUE) +
+    theme(panel.spacing.x = grid::unit(.7, "lines"),
+          axis.text.x = element_text(angle = 40, hjust = 1, size = font$axis + 1))
+  if (!show_x) p <- p + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+  p
+}
+fig12 <- wrap_plots(
+  bar_panel("LOY", loy_y_genes, "Y-linked genes in LOY-candidate cells", ymax[["Y"]], FALSE),
+  bar_panel("LOY", loy_x_genes, "X counterparts in LOY-candidate cells", ymax[["X"]], FALSE),
+  bar_panel("YINTACT", loy_y_genes, "Y-linked genes in YINTACT cells", ymax[["Y"]], FALSE),
+  bar_panel("YINTACT", loy_x_genes, "X counterparts in YINTACT cells", ymax[["X"]], TRUE),
+  ncol = 1, heights = c(.8, 1, 1, 1)
+) + plot_annotation(title = "Y-linked and X-counterpart expression by LOY status",
+                    subtitle = "Paired donor CD45.2-positive pseudobulks from S1-S8; Ambiguous cells excluded",
+                    tag_levels = "A")
+register_sheet("YX_PB_plot_values", yx_pb_plot, "yx-bars-from-16-pseudobulks",
+               "TMM-normalized trusted Y/X expression used in Figure 12")
+save_fig(fig12, 12)
+fig12
+```
+
+**Figure 12 | Trusted Y/X expression in state-specific pseudobulks.** **A-B,** Trusted Y genes and X counterparts in LOY-candidate pseudobulks. **C-D,** The corresponding profiles in YINTACT pseudobulks. These classifier genes demonstrate internal call consistency rather than independent validation.
+
+### Pseudobulk Y/X heatmap
+
+The same TMM-normalized values are summarized in a paired heatmap. Columns identify sample, state, and contributing-cell number, allowing direct comparison of every LOY-YINTACT pair.
+
+```{r yx-pseudobulk-heatmap, fig.width=14, fig.height=7}
+hm_meta <- pb_coldata |>
+  arrange(sample_id, state) |>
+  mutate(pb_id = as.character(pb_id), column = paste0(sample_id, "\n", state, "\nn=", n_cells))
+hm <- as.data.frame(as.table(pb_logcpm_display[classifier_genes, hm_meta$pb_id, drop = FALSE]))
+names(hm) <- c("gene", "pb_id", "log2CPM")
+hm <- hm |>
+  left_join(select(hm_meta, pb_id, column, condition, state), by = "pb_id") |>
+  mutate(gene_group = if_else(gene %in% loy_y_genes, "Y-linked genes", "X counterparts"),
+         gene = factor(gene, levels = rev(classifier_genes)),
+         column = factor(column, levels = hm_meta$column),
+         light_text = log2CPM > .55 * max(log2CPM))
+fig13 <- ggplot(hm, aes(column, gene, fill = log2CPM)) +
+  geom_tile(color = "white", linewidth = .7) +
+  geom_text(aes(label = sprintf("%.1f", log2CPM), color = light_text), size = 3) +
+  facet_grid(gene_group ~ condition, scales = "free", space = "free") +
+  scale_fill_viridis_c(option = "magma", limits = c(0, max(hm$log2CPM)), name = "log2(CPM + 1)") +
+  scale_color_manual(values = c(`FALSE` = "black", `TRUE` = "white"), guide = "none") +
+  labs(title = "Y-linked and X-counterpart expression across paired pseudobulks",
+       subtitle = "TMM-normalized expression; Ambiguous cells excluded", x = NULL, y = NULL) +
+  theme_nature() + theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "right")
+register_sheet("YX_PB_heatmap", hm, "yx-pseudobulk-heatmap", "Data underlying the paired pseudobulk Y/X heatmap")
+save_fig(fig13, 13)
+fig13
+```
+
+**Figure 13 | Paired pseudobulk Y/X heatmap.** TMM-normalized trusted Y and X-counterpart expression is shown for all 16 state-specific pseudobulks, with the number of contributing cells reported in each column label.
+
+## State-resolved pseudobulk differential expression
+
+Raw pseudobulk counts are filtered, TMM-normalized, and transformed with voom. A condition-by-state model with mouse-level duplicate correlation estimates LOY versus YINTACT under Placebo and Chemo, treatment effects within each state, and the formal interaction.
+
+```{r pseudobulk-differential-expression}
+pb_coldata <- pb_coldata |>
+  mutate(condition = relevel(factor(condition), "Placebo"),
+         state = relevel(factor(state), "YINTACT")) |>
+  arrange(sample_id, state)
+pb_counts <- pb_counts[, as.character(pb_coldata$pb_id), drop = FALSE]
+design <- model.matrix(~condition * state, pb_coldata)
+colnames(design) <- make.names(colnames(design))
+dge <- DGEList(pb_counts)
+keep <- filterByExpr(dge, design)
+dge <- calcNormFactors(dge[keep, , keep.lib.sizes = FALSE])
+block <- factor(pb_coldata$sample_id)
+voom0 <- voom(dge, design, plot = FALSE)
+rho <- duplicateCorrelation(voom0, design, block = block)$consensus.correlation
+v <- voom(dge, design, block = block, correlation = rho, plot = FALSE)
+rho <- duplicateCorrelation(v, design, block = block)$consensus.correlation
+fit <- lmFit(v, design, block = block, correlation = rho)
+contrasts <- makeContrasts(
+  Placebo_LOY_vs_YINTACT = stateLOY,
+  Chemo_LOY_vs_YINTACT = stateLOY + conditionChemo.stateLOY,
+  Chemo_vs_Placebo_YINTACT = conditionChemo,
+  Chemo_vs_Placebo_LOY = conditionChemo + conditionChemo.stateLOY,
+  Interaction = conditionChemo.stateLOY,
+  levels = design
+)
+fit <- eBayes(contrasts.fit(fit, contrasts), robust = TRUE)
+de_sheets <- setNames(lapply(seq_len(ncol(contrasts)), function(i)
+  topTable(fit, coef = i, number = Inf, sort.by = "P") |>
+    rownames_to_column("gene") |>
+    mutate(classifier_input = gene %in% classifier_genes,
+           direction = case_when(adj.P.Val < .05 & logFC > 0 ~ "Up",
+                                 adj.P.Val < .05 & logFC < 0 ~ "Down", TRUE ~ "NS"))),
+  paste0("DE_", colnames(contrasts)))
+de_summary <- bind_rows(de_sheets, .id = "contrast") |>
+  count(contrast, direction, name = "genes") |>
+  complete(contrast, direction = c("Down", "NS", "Up"), fill = list(genes = 0))
+pb_voom_logcpm <- v$E
+pb_model_metadata <- pb_coldata |>
+  mutate(raw_library_size = as.numeric(Matrix::colSums(pb_counts)),
+         filtered_library_size = dge$samples$lib.size,
+         TMM_factor = dge$samples$norm.factors,
+         effective_library_size = filtered_library_size * TMM_factor)
+register_sheet("PB_raw_counts", matrix_df(pb_counts), "pseudobulk-differential-expression", "Raw gene-by-pseudobulk UMI counts")
+register_sheet("PB_TMM_CPM", matrix_df(pb_tmm_cpm), "pseudobulk-differential-expression", "Non-log TMM-normalized CPM for all pseudobulk genes")
+register_sheet("PB_log2_CPM1", matrix_df(pb_logcpm_display), "pseudobulk-differential-expression", "TMM-normalized log2(CPM + 1) used for classifier-expression figures")
+register_sheet("PB_voom_logCPM", matrix_df(pb_voom_logcpm), "pseudobulk-differential-expression", "Voom log2 CPM values for genes tested by limma")
+register_sheet("PB_model_metadata", pb_model_metadata, "pseudobulk-differential-expression", "Pseudobulk library sizes and TMM factors")
+register_sheet("DE_summary", de_summary, "pseudobulk-differential-expression", "Numbers of upregulated, downregulated, and nonsignificant genes per contrast")
+for (nm in names(de_sheets)) register_sheet(nm, de_sheets[[nm]], "pseudobulk-differential-expression",
+                                            paste("Complete limma table for", sub("^DE_", "", nm)))
+model_rds <- fnm2("objects", "pseudobulk_DE_model.rds")
+saveRDS(list(dge = dge, design = design, contrasts = contrasts, fit = fit, voom = v,
+             correlation = rho, de = de_sheets), model_rds)
+register_file("Pseudobulk DE model", model_rds, "pseudobulk-differential-expression",
+              "edgeR, voom, limma model, contrasts, and complete DE tables")
+cat("Genes tested:", nrow(pb_voom_logcpm), "\nWithin-mouse correlation:", round(rho, 3), "\n")
+kable(de_summary, caption = "Differential-expression calls for the five state and treatment contrasts.")
+```
+
+## GO and KEGG pathway analysis
+
+The moderated limma *t* statistic ranks genes for GO Biological Process and KEGG GSEA. The six trusted Y/X genes displayed in the classifier diagnostics are excluded from ranking, complete pathway results are retained, and the figure shows up to eight FDR-significant pathways per database and contrast.
+
+```{r go-kegg-gsea, fig.width=16, fig.height=12}
+de <- bind_rows(de_sheets, .id = "contrast") |>
+  mutate(contrast = sub("^DE_", "", contrast))
+id_map <- bitr(unique(de$gene), fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Mm.eg.db) |>
+  distinct(SYMBOL, .keep_all = TRUE)
+run_gsea <- function(d, database) {
+  ranked <- d |>
+    filter(!gene %in% classifier_genes) |>
+    inner_join(id_map, by = c("gene" = "SYMBOL")) |>
+    arrange(desc(abs(t))) |>
+    distinct(ENTREZID, .keep_all = TRUE)
+  genes <- sort(setNames(ranked$t, ranked$ENTREZID), decreasing = TRUE)
+  if (database == "GO BP") {
+    gseGO(genes, OrgDb = org.Mm.eg.db, keyType = "ENTREZID", ont = "BP",
+          minGSSize = 10, maxGSSize = 500, pvalueCutoff = 1, pAdjustMethod = "BH",
+          eps = 0, seed = TRUE, verbose = FALSE)
+  } else {
+    gseKEGG(genes, organism = "mmu", minGSSize = 10, maxGSSize = 500,
+            pvalueCutoff = 1, pAdjustMethod = "BH", eps = 0, seed = TRUE, verbose = FALSE)
+  }
+}
+set.seed(params$seed)
+gsea_grid <- crossing(contrast = unique(de$contrast), database = c("GO BP", "KEGG"))
+gsea_objects <- setNames(Map(function(contrast, database)
+  run_gsea(filter(de, .data$contrast == .env$contrast), database),
+  gsea_grid$contrast, gsea_grid$database), paste(gsea_grid$contrast, gsea_grid$database, sep = "___"))
+gsea_report <- bind_rows(lapply(names(gsea_objects), function(name) {
+  result <- as.data.frame(gsea_objects[[name]])
+  if (!nrow(result)) return(NULL)
+  label <- strsplit(name, "___", fixed = TRUE)[[1]]
+  mutate(result, contrast = label[1], database = label[2], .before = 1)
+}))
+top_pathways <- gsea_report |>
+  filter(p.adjust < .05) |>
+  group_by(database, contrast) |>
+  slice_min(p.adjust, n = 8, with_ties = FALSE) |>
+  ungroup() |>
+  arrange(database, contrast, NES) |>
+  mutate(FDR_score = -log10(pmax(p.adjust, 1e-300)))
+register_sheet("GSEA_all", gsea_report, "go-kegg-gsea", "Complete GO Biological Process and KEGG GSEA results")
+register_sheet("GSEA_top", top_pathways, "go-kegg-gsea", "Top FDR-significant pathways displayed in Figure 14")
+gsea_rds <- fnm2("objects", "GO_KEGG_GSEA_objects.rds")
+saveRDS(gsea_objects, gsea_rds)
+register_file("GSEA objects", gsea_rds, "go-kegg-gsea", "Complete clusterProfiler GO and KEGG result objects")
+if (!nrow(top_pathways)) {
+  fig14 <- ggplot() + annotate("text", x = 0, y = 0, label = "No GO-BP or KEGG pathway reached FDR < 0.05") +
+    xlim(-1, 1) + ylim(-1, 1) + labs(title = "State- and treatment-resolved pathway enrichment") + theme_void()
+  save_fig(fig14, 14)
+  fig14
+} else {
+  key <- with(top_pathways, paste(Description, contrast, database, sep = "___"))
+  top_pathways$term <- factor(key, levels = unique(key))
+  fig14 <- ggplot(top_pathways, aes(NES, term, size = setSize, color = FDR_score)) +
+    geom_point() + geom_vline(xintercept = 0, linetype = 2, linewidth = .3) +
+    facet_grid(database ~ contrast, scales = "free_y", space = "free_y") +
+    scale_y_discrete(labels = function(x) sub("___.*$", "", x)) +
+    labs(x = "Normalized enrichment score", y = NULL,
+         size = "Gene-set size", color = "-log10 FDR") +
+    theme_nature() + theme(axis.text.y = element_text(size = 6))
+  save_fig(fig14, 14)
+  fig14
+}
+```
+
+**Figure 14 | State- and treatment-resolved GO and KEGG enrichment.** Positive and negative normalized enrichment scores identify pathways associated with the positive and negative sides of each contrast. Point size represents gene-set size and color represents FDR significance; `r nrow(top_pathways)` database-contrast pathway entries met FDR < 0.05 and were selected for display.
+
+## Review-data workbook and reproducibility objects
+
+All reviewable tables are consolidated into one indexed Excel workbook. Full single-cell RNA layers are retained in the Seurat RDS rather than written to Excel because a gene-by-cell matrix exceeds Excel's column limit; the workbook includes complete cell metadata, ADT counts and CLR values, classifier-gene RNA layers, all detected Y-gene counts, pseudobulk matrices, DE results, and enrichment tables.
+
+```{r export-review-data}
+register_sheet("Cell_metadata", cell_df(cite_clean), "export-review-data", "Final cell-level metadata, QC, CD45 origin, and LOY assignments")
+register_sheet("ADT_counts", cell_matrix_df(adt_counts), "export-review-data", "Cell-by-antibody raw ADT counts")
+register_sheet("ADT_CLR", cell_matrix_df(adt_clr), "export-review-data", "Cell-by-antibody CLR-normalized ADT expression")
+register_sheet("Classifier_RNA_counts", cell_matrix_df(rna_counts[classifier_genes, , drop = FALSE]),
+               "export-review-data", "Cell-by-gene raw counts for the six trusted Y/X genes")
+register_sheet("Classifier_RNA_log", cell_matrix_df(rna_data[classifier_genes, , drop = FALSE]),
+               "export-review-data", "Cell-by-gene log-normalized expression for the six trusted Y/X genes")
+register_sheet("Y_RNA_counts", cell_matrix_df(rna_counts[all_y_genes_detected, , drop = FALSE]),
+               "export-review-data", "Cell-by-gene raw counts for all detected Y-linked genes")
+register_sheet("Y_RNA_log", cell_matrix_df(rna_data[all_y_genes_detected, , drop = FALSE]),
+               "export-review-data", "Cell-by-gene log-normalized expression for all detected Y-linked genes")
+
+seurat_rds <- fnm2("objects", "cite_clean_LOY.rds")
+analysis_rds <- fnm2("objects", "LOY_chemo_analysis_objects.rds")
+saveRDS(cite_clean, seurat_rds)
+saveRDS(list(sample_design = sample_design, calls = calls, loy_retained = loy_retained,
+             pb_counts = pb_counts, pb_coldata = pb_coldata, pb_tmm_cpm = pb_tmm_cpm,
+             pb_voom_logcpm = pb_voom_logcpm, de_sheets = de_sheets,
+             gsea_report = gsea_report, top_pathways = top_pathways), analysis_rds)
+register_file("Filtered Seurat object", seurat_rds, "export-review-data",
+              "Complete filtered Seurat object containing full RNA and ADT assay layers")
+register_file("Analysis objects", analysis_rds, "export-review-data",
+              "Key classifier, pseudobulk, DE, and pathway objects")
+register_sheet("Session_info", tibble(line = capture.output(sessionInfo())), "export-review-data",
+               "R session and package versions")
+
+review$index <- review$index |>
+  arrange(factor(kind, levels = c("sheet", "file")), source_chunk, name)
+workbook <- fnm2("tables", "LOY_chemo_review_data.xlsx")
+write.xlsx(c(list(INDEX = review$index), review$sheets), workbook,
+           overwrite = TRUE, freezePane = TRUE, autoFilter = TRUE)
+cat("Review workbook:", workbook, "\nSheets:", length(review$sheets), "\nIndexed files:", sum(review$index$kind == "file"), "\n")
+```
