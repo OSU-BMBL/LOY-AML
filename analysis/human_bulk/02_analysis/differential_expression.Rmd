@@ -1,0 +1,598 @@
+---
+title: "Human AML bulk RNA-seq: differential expression"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+source("analysis/human_bulk/config.R")
+# Report display options
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(echo = FALSE)
+library(DESeq2)
+library(tidyverse)
+library(fgsea)
+library(data.table)
+library(qs)
+library(ggrepel)
+
+all_gene_sets <- qs::qread(bulk_files$gene_sets)
+
+```
+
+# Overview
+
+```{r}
+merged_counts1 <- read.csv(bulk_files$counts, sep = ",", header = T, row.names = 1)
+merged_meta1 <- read.csv(bulk_files$metadata, stringsAsFactors = F, row.names = 1)
+
+merged_meta1$Cyto.Group <- paste0(merged_meta1$Cyto.Group, "-", merged_meta1$Sex)
+```
+
+# PCA plots
+
+```{r}
+batch_info <- factor(merged_meta1$Batch)
+merged_counts1_corrected <- merged_counts1
+
+merged_counts1_corrected[merged_counts1_corrected < 0] <- 0
+
+dds <- DESeq2::DESeqDataSetFromMatrix(
+  countData = round(as.matrix(merged_counts1_corrected)),
+  colData = merged_meta1,
+  design = ~ Cyto.Group + Batch
+)
+
+vsd <- vst(dds, blind = FALSE)
+
+```
+
+```{r, fig.width=7, fig.height=5}
+pcaData <- plotPCA(vsd, intgroup = c("Cyto.Group", "Sex"), returnData = TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+ggplot(pcaData, aes(PC1, PC2, color = Cyto.Group)) +
+  geom_point(size = 3) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) +
+  theme_classic() +
+  geom_label_repel(
+    label = merged_meta1$Cyto.Group,
+    nudge_x = 1, nudge_y = 1,
+    check_overlap = T
+  )
+
+```
+
+# LOY male vs CN male
+
+## Differential gene expression analysis
+
+```{r, eval=T}
+this_groups <- c("LOY-Male", "CN_AML-Male")
+
+merged_meta2 <- merged_meta1 %>%
+  dplyr::filter(Cyto.Group %in% this_groups)
+merged_counts2 <- merged_counts1[, merged_meta2$sample_id]
+merged_counts2[merged_counts2 < 0] <- 0
+
+dds <- DESeq2::DESeqDataSetFromMatrix(
+  countData = round(as.matrix(merged_counts2)),
+  colData = merged_meta2,
+  design = ~ Cyto.Group + Batch
+)
+
+vsd <- vst(dds, blind = FALSE)
+
+design(dds) <- formula(~ Cyto.Group + Batch)
+dds <- DESeq(dds)
+
+res <- results(dds, contrast = c("Cyto.Group", this_groups[1], this_groups[2]))
+result <- as.data.frame(res[order(res$pvalue),])
+summary(res, alpha = 0.05)
+
+result_save <- result %>%
+  arrange(desc(log2FoldChange))
+
+this_filename <- bulk_contrast_name(this_groups)
+write.csv(result_save, file.path(bulk_dirs$differential_expression, paste0(this_filename, ".csv")))
+
+plotCounts(dds, "ZNF560", intgroup = "Cyto.Group")
+
+```
+
+## Gene-set enrichment
+
+```{r, eval=T}
+
+res_gsea <- result %>%
+  rownames_to_column("gene") %>%
+  dplyr::select(gene, stat) %>%
+  arrange(desc(stat)) %>%
+  na.omit() %>%
+  distinct() %>%
+  group_by(gene) %>%
+  deframe() %>%
+  sort(decreasing = T)
+
+this_terms <- all_gene_sets %>%
+  filter(gs_cat == 'C5' & gs_subcat == 'GO:BP')
+
+m_list <- this_terms %>% split(x = .$gene_symbol, f = .$gs_name)
+
+fgseaRes <- fgsea(
+  pathways = m_list,
+  stats = res_gsea,
+  nperm = 10000
+)
+
+fgseaResTidy <- fgseaRes %>%
+  as_tibble() %>%
+  dplyr::filter(padj < 0.1) %>%
+  arrange(desc(NES)) %>%
+  dplyr::select(-ES) %>%
+  arrange(padj, desc(NES))
+
+fwrite(
+  fgseaResTidy,
+  file = file.path(bulk_dirs$enrichment, paste0(this_filename, "_gobp.csv")),
+  sep = ",",
+  sep2 = c("", " ", "")
+)
+
+this_terms <- all_gene_sets %>%
+  filter(gs_cat == 'C2' & gs_subcat == 'CP:REACTOME')
+
+m_list <- this_terms %>% split(x = .$gene_symbol, f = .$gs_name)
+
+fgseaRes <- fgsea(
+  pathways = m_list,
+  stats = res_gsea,
+  nperm = 10000
+)
+
+fgseaResTidy <- fgseaRes %>%
+  as_tibble() %>%
+  dplyr::filter(padj < 0.1) %>%
+  arrange(desc(NES)) %>%
+  dplyr::select(-ES) %>%
+  arrange(padj, desc(NES))
+
+fwrite(
+  fgseaResTidy,
+  file = file.path(bulk_dirs$enrichment, paste0(this_filename, "_reactome.csv")),
+  sep = ",",
+  sep2 = c("", " ", "")
+)
+
+```
+
+```{r}
+dbs <-
+  c(
+    "GO_Molecular_Function_2023",
+    "GO_Cellular_Component_2023",
+    "GO_Biological_Process_2023",
+    "Reactome_2022",
+    "BioPlanet_2019"
+  )
+
+this_up <- result_save %>%
+  filter(log2FoldChange > 0)
+
+enriched_combined <- enrichR::enrichr(rownames(this_up), dbs)
+enriched_combined <- lapply(enriched_combined, function(x) {
+  x$Overlap <- paste0(" ", x$Overlap)
+  return(x[, c(-5, -6)])
+})
+
+write.csv(
+  enriched_combined$GO_Molecular_Function_2023,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_go_mf_up.csv"))
+)
+write.csv(
+  enriched_combined$GO_Cellular_Component_2023,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_go_cc_up.csv"))
+)
+write.csv(
+  enriched_combined$GO_Biological_Process_2023,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_go_bp_up.csv"))
+)
+write.csv(
+  enriched_combined$Reactome_2022,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_reactome_up.csv"))
+)
+write.csv(
+  enriched_combined$BioPlanet_2019,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_bioplanet_up.csv"))
+
+)
+
+this_down <- result_save %>%
+  filter(log2FoldChange < 0)
+
+enriched_combined <- enrichR::enrichr(rownames(this_down), dbs)
+enriched_combined <- lapply(enriched_combined, function(x) {
+  x$Overlap <- paste0(" ", x$Overlap)
+  return(x[, c(-5, -6)])
+})
+
+write.csv(
+  enriched_combined$GO_Molecular_Function_2023,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_go_mf_down.csv"))
+)
+write.csv(
+  enriched_combined$GO_Cellular_Component_2023,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_go_cc_down.csv"))
+)
+write.csv(
+  enriched_combined$GO_Biological_Process_2023,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_go_bp_down.csv"))
+)
+write.csv(
+  enriched_combined$Reactome_2022,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_reactome_down.csv"))
+)
+write.csv(
+  enriched_combined$BioPlanet_2019,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_bioplanet_down.csv"))
+)
+```
+
+# LOY male vs CN female
+
+## Differential gene expression analysis
+
+```{r, eval=T}
+this_groups <- c("LOY-Male", "CN_AML-Female")
+
+merged_meta2 <- merged_meta1 %>%
+  dplyr::filter(Cyto.Group %in% this_groups)
+merged_counts2 <- merged_counts1[, merged_meta2$sample_id]
+merged_counts2[merged_counts2 < 0] <- 0
+
+dds <- DESeq2::DESeqDataSetFromMatrix(
+  countData = round(as.matrix(merged_counts2)),
+  colData = merged_meta2,
+  design = ~ Cyto.Group + Batch
+)
+
+vsd <- vst(dds, blind = FALSE)
+
+design(dds) <- formula(~ Cyto.Group + Batch)
+dds <- DESeq(dds)
+
+res <- results(dds, contrast = c("Cyto.Group", this_groups[1], this_groups[2]))
+result <- as.data.frame(res[order(res$pvalue),])
+summary(res, alpha = 0.05)
+
+result_save <- result %>%
+  arrange(desc(log2FoldChange))
+
+this_filename <- bulk_contrast_name(this_groups)
+write.csv(result_save, file.path(bulk_dirs$differential_expression, paste0(this_filename, ".csv")))
+
+```
+
+## Gene-set enrichment
+
+```{r, eval=T}
+
+res_gsea <- result %>%
+  rownames_to_column("gene") %>%
+  dplyr::select(gene, stat) %>%
+  arrange(desc(stat)) %>%
+  na.omit() %>%
+  distinct() %>%
+  group_by(gene) %>%
+  deframe() %>%
+  sort(decreasing = T)
+
+this_terms <- all_gene_sets %>%
+  filter(gs_cat == 'C5' & gs_subcat == 'GO:BP')
+
+m_list <- this_terms %>% split(x = .$gene_symbol, f = .$gs_name)
+
+fgseaRes <- fgsea(
+  pathways = m_list,
+  stats = res_gsea,
+  nperm = 10000
+)
+
+fgseaResTidy <- fgseaRes %>%
+  as_tibble() %>%
+  dplyr::filter(padj < 0.1) %>%
+  arrange(desc(NES)) %>%
+  dplyr::select(-ES) %>%
+  arrange(padj, desc(NES))
+
+fwrite(
+  fgseaResTidy,
+  file = file.path(bulk_dirs$enrichment, paste0(this_filename, "_gobp.csv")),
+  sep = ",",
+  sep2 = c("", " ", "")
+)
+
+this_terms <- all_gene_sets %>%
+  filter(gs_cat == 'C2' & gs_subcat == 'CP:REACTOME')
+
+m_list <- this_terms %>% split(x = .$gene_symbol, f = .$gs_name)
+
+fgseaRes <- fgsea(
+  pathways = m_list,
+  stats = res_gsea,
+  nperm = 10000
+)
+
+fgseaResTidy <- fgseaRes %>%
+  as_tibble() %>%
+  dplyr::filter(padj < 0.1) %>%
+  arrange(desc(NES)) %>%
+  dplyr::select(-ES) %>%
+  arrange(padj, desc(NES))
+
+fwrite(
+  fgseaResTidy,
+  file = file.path(bulk_dirs$enrichment, paste0(this_filename, "_reactome.csv")),
+  sep = ",",
+  sep2 = c("", " ", "")
+)
+
+```
+
+```{r}
+dbs <-
+  c(
+    "GO_Molecular_Function_2023",
+    "GO_Cellular_Component_2023",
+    "GO_Biological_Process_2023",
+    "Reactome_2022",
+    "BioPlanet_2019"
+  )
+
+this_up <- result_save %>%
+  filter(log2FoldChange > 0)
+
+enriched_combined <- enrichR::enrichr(rownames(this_up), dbs)
+enriched_combined <- lapply(enriched_combined, function(x) {
+  x$Overlap <- paste0(" ", x$Overlap)
+  return(x[, c(-5, -6)])
+})
+
+write.csv(
+  enriched_combined$GO_Molecular_Function_2023,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_go_mf_up.csv"))
+)
+write.csv(
+  enriched_combined$GO_Cellular_Component_2023,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_go_cc_up.csv"))
+)
+write.csv(
+  enriched_combined$GO_Biological_Process_2023,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_go_bp_up.csv"))
+)
+write.csv(
+  enriched_combined$Reactome_2022,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_reactome_up.csv"))
+)
+write.csv(
+  enriched_combined$BioPlanet_2019,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_bioplanet_up.csv"))
+
+)
+
+this_down <- result_save %>%
+  filter(log2FoldChange < 0)
+
+enriched_combined <- enrichR::enrichr(rownames(this_down), dbs)
+enriched_combined <- lapply(enriched_combined, function(x) {
+  x$Overlap <- paste0(" ", x$Overlap)
+  return(x[, c(-5, -6)])
+})
+
+write.csv(
+  enriched_combined$GO_Molecular_Function_2023,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_go_mf_down.csv"))
+)
+write.csv(
+  enriched_combined$GO_Cellular_Component_2023,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_go_cc_down.csv"))
+)
+write.csv(
+  enriched_combined$GO_Biological_Process_2023,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_go_bp_down.csv"))
+)
+write.csv(
+  enriched_combined$Reactome_2022,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_reactome_down.csv"))
+)
+write.csv(
+  enriched_combined$BioPlanet_2019,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_bioplanet_down.csv"))
+)
+```
+
+# CN male vs CN female
+
+## Differential gene expression analysis
+
+```{r, eval=T}
+this_groups <- c("CN_AML-Male", "CN_AML-Female")
+
+merged_meta2 <- merged_meta1 %>%
+  dplyr::filter(Cyto.Group %in% this_groups)
+merged_counts2 <- merged_counts1[, merged_meta2$sample_id]
+merged_counts2[merged_counts2 < 0] <- 0
+
+dds <- DESeq2::DESeqDataSetFromMatrix(
+  countData = round(as.matrix(merged_counts2)),
+  colData = merged_meta2,
+  design = ~ Cyto.Group + Batch
+)
+
+vsd <- vst(dds, blind = FALSE)
+
+design(dds) <- formula(~ Cyto.Group + Batch)
+dds <- DESeq(dds)
+
+res <- results(dds, contrast = c("Cyto.Group", this_groups[1], this_groups[2]))
+result <- as.data.frame(res[order(res$pvalue),])
+summary(res, alpha = 0.05)
+
+result_save <- result %>%
+  arrange(desc(log2FoldChange))
+
+this_filename <- bulk_contrast_name(this_groups)
+write.csv(result_save, file.path(bulk_dirs$differential_expression, paste0(this_filename, ".csv")))
+
+```
+
+## Gene-set enrichment
+
+```{r, eval=T}
+
+res_gsea <- result %>%
+  rownames_to_column("gene") %>%
+  dplyr::select(gene, log2FoldChange) %>%
+  arrange(desc(log2FoldChange)) %>%
+  na.omit() %>%
+  distinct() %>%
+  group_by(gene) %>%
+  deframe() %>%
+  sort(decreasing = T)
+
+this_terms <- all_gene_sets %>%
+  filter(gs_cat == 'C5' & gs_subcat == 'GO:BP')
+
+m_list <- this_terms %>% split(x = .$gene_symbol, f = .$gs_name)
+
+fgseaRes <- fgsea(
+  pathways = m_list,
+  stats = res_gsea,
+  nperm = 10000
+)
+
+fgseaResTidy <- fgseaRes %>%
+  as_tibble() %>%
+  dplyr::filter(padj < 0.1) %>%
+  arrange(desc(NES)) %>%
+  dplyr::select(-ES) %>%
+  arrange(padj, desc(NES))
+
+fwrite(
+  fgseaResTidy,
+  file = file.path(bulk_dirs$enrichment, paste0(this_filename, "_gobp.csv")),
+  sep = ",",
+  sep2 = c("", " ", "")
+)
+
+this_terms <- all_gene_sets %>%
+  filter(gs_cat == 'C2' & gs_subcat == 'CP:REACTOME')
+
+m_list <- this_terms %>% split(x = .$gene_symbol, f = .$gs_name)
+
+fgseaRes <- fgsea(
+  pathways = m_list,
+  stats = res_gsea,
+  nperm = 10000
+)
+
+fgseaResTidy <- fgseaRes %>%
+  as_tibble() %>%
+  dplyr::filter(padj < 0.1) %>%
+  arrange(desc(NES)) %>%
+  dplyr::select(-ES) %>%
+  arrange(padj, desc(NES))
+
+fwrite(
+  fgseaResTidy,
+  file = file.path(bulk_dirs$enrichment, paste0(this_filename, "_reactome.csv")),
+  sep = ",",
+  sep2 = c("", " ", "")
+)
+
+```
+
+```{r}
+dbs <-
+  c(
+    "GO_Molecular_Function_2023",
+    "GO_Cellular_Component_2023",
+    "GO_Biological_Process_2023",
+    "Reactome_2022",
+    "BioPlanet_2019"
+  )
+
+this_up <- result_save %>%
+  filter(log2FoldChange > 0)
+
+enriched_combined <- enrichR::enrichr(rownames(this_up), dbs)
+enriched_combined <- lapply(enriched_combined, function(x) {
+  x$Overlap <- paste0(" ", x$Overlap)
+  return(x[, c(-5, -6)])
+})
+
+write.csv(
+  enriched_combined$GO_Molecular_Function_2023,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_go_mf_up.csv"))
+)
+write.csv(
+  enriched_combined$GO_Cellular_Component_2023,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_go_cc_up.csv"))
+)
+write.csv(
+  enriched_combined$GO_Biological_Process_2023,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_go_bp_up.csv"))
+)
+write.csv(
+  enriched_combined$Reactome_2022,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_reactome_up.csv"))
+)
+write.csv(
+  enriched_combined$BioPlanet_2019,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_bioplanet_up.csv"))
+
+)
+
+this_down <- result_save %>%
+  filter(log2FoldChange < 0)
+
+enriched_combined <- enrichR::enrichr(rownames(this_down), dbs)
+enriched_combined <- lapply(enriched_combined, function(x) {
+  x$Overlap <- paste0(" ", x$Overlap)
+  return(x[, c(-5, -6)])
+})
+
+write.csv(
+  enriched_combined$GO_Molecular_Function_2023,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_go_mf_down.csv"))
+)
+write.csv(
+  enriched_combined$GO_Cellular_Component_2023,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_go_cc_down.csv"))
+)
+write.csv(
+  enriched_combined$GO_Biological_Process_2023,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_go_bp_down.csv"))
+)
+write.csv(
+  enriched_combined$Reactome_2022,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_reactome_down.csv"))
+)
+write.csv(
+  enriched_combined$BioPlanet_2019,
+  file.path(bulk_dirs$enrichment, paste0(this_filename, "_bioplanet_down.csv"))
+)
+```
+
+# Session info
+
+```{r, echo=TRUE}
+
+sessionInfo()
+
+```

@@ -1,0 +1,154 @@
+---
+title: "CITE-seq sample assignment"
+output:
+  html_document:
+    code_folding: show
+    theme: cosmo
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+source("config/paths.R")
+source("analysis/preprocessing/config.R")
+preprocessing <- preprocessing_paths()
+knitr::opts_knit$set(root.dir = preprocessing$root)
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 10, fig.height = 7
+)
+```
+
+# 1. Set-Up
+
+Assign demultiplexed sample IDs to integrated LOY cells using the barcode files for each pool.
+
+## 1.1 Libraries
+
+```{r setup_libs}
+library(Seurat)
+library(dplyr)
+library(qs)
+library(stringr)
+```
+
+## 1.2 Define Paths and Sample Information
+
+```{r setup_variables}
+# --- Input/Output Files ---
+INTEGRATED_QS_PATH <- preprocessing$integrated
+OUTPUT_QS_PATH <- preprocessing$sample_assigned
+
+# --- Data Locations ---
+INDIVIDUAL_COUNTS_DIR <- preprocessing$sample_barcodes
+
+# Define which samples belong to which pool
+POOL_MAP <- list(
+  "Pool1" = c("S1", "S4"),
+  "Pool2" = c("S5", "S6"),
+  "Pool3" = c("S2", "S3")
+)
+```
+
+# 2. Load Data
+
+```{r load_integrated_object}
+if (!file.exists(INTEGRATED_QS_PATH)) {
+  stop(paste("Input file not found:", INTEGRATED_QS_PATH))
+}
+
+integrated_seurat_obj <- qread(INTEGRATED_QS_PATH)
+cat("Successfully loaded the integrated Seurat object.\n")
+```
+
+# 3. Add New Metadata with Strict Mapping
+
+Map each pool using only its constituent sample barcode files.
+
+```{r add_metadata_strict}
+cat("\n--- Adding 'sample_id' metadata using a strict, pool-specific mapping logic ---\n")
+
+# Get the full metadata data frame
+metadata <- integrated_seurat_obj@meta.data
+
+# Create the new 'sample_id' column, initializing with NA
+metadata$sample_id <- NA_character_
+
+# Loop through each pool defined in our map
+for (pool_name in names(POOL_MAP)) {
+
+  samples_in_pool <- POOL_MAP[[pool_name]]
+  cat(paste0("\nProcessing ", pool_name, " (contains samples: ", paste(samples_in_pool, collapse=", "), ")\n"))
+
+  # --- Create a barcode map ONLY for the samples in this pool ---
+  pool_barcode_map <- character()
+  for (sample_name in samples_in_pool) {
+    barcode_file_path <- file.path(INDIVIDUAL_COUNTS_DIR, sample_name, "sample_filtered_feature_bc_matrix", "barcodes.tsv.gz")
+    if (!file.exists(barcode_file_path)) {
+      stop(paste("Barcode file not found for sample:", sample_name))
+    }
+    barcodes <- read.table(barcode_file_path, header = FALSE)$V1
+    sample_map <- setNames(rep(sample_name, length(barcodes)), barcodes)
+    pool_barcode_map <- c(pool_barcode_map, sample_map)
+  }
+
+  # --- Apply this pool-specific map ---
+  # Identify which cells in the full object belong to this pool
+  is_in_current_pool <- metadata$orig.ident.x %in% pool_name
+
+  if(sum(is_in_current_pool) == 0) {
+      cat(paste("Warning: No cells found for", pool_name, "in the Seurat object. Skipping.\n"))
+      next
+  }
+
+  # Get the cell names for only the cells in this pool
+  pool_cell_names <- rownames(metadata)[is_in_current_pool]
+
+  # Extract the core barcode sequence
+  core_barcodes <- str_remove(pool_cell_names, "^[a-zA-Z0-9]+_")
+
+  # Use the pool-specific map to look up the sample ID
+  sample_ids_for_pool_cells <- unname(pool_barcode_map[core_barcodes])
+
+  # Fill in the 'sample_id' column for only the cells in this pool
+  metadata$sample_id[is_in_current_pool] <- sample_ids_for_pool_cells
+
+  cat(paste("Finished mapping cells for", pool_name, "\n"))
+}
+
+# Add the updated metadata back to the Seurat object
+integrated_seurat_obj$sample_id <- metadata$sample_id
+
+cat("\nSuccessfully added the 'sample_id' metadata column.\n")
+```
+
+# 4. Verification
+
+Summarize sample assignments within each pool.
+
+```{r verify_metadata}
+cat("\n--- Verifying the new metadata ---\n\n")
+
+cat("Total cell counts per original sample (S1-S6 should have counts, others NA):\n")
+print(table(integrated_seurat_obj$sample_id, useNA = "ifany"))
+
+cat("\nCell counts per sample within each pool:\n")
+# Filter metadata for only LOY pools before creating the table
+loy_meta <- integrated_seurat_obj@meta.data %>% filter(!is.na(sample_id))
+print(table(Pool = loy_meta$orig.ident.x, Sample = loy_meta$sample_id))
+```
+
+# 5. Save Updated Object
+
+Save the object with the assigned sample IDs.
+
+```{r save_updated_object}
+# Save the final integrated object with the new metadata
+qs::qsave(integrated_seurat_obj, OUTPUT_QS_PATH)
+cat(paste("\nSuccessfully saved the updated Seurat object to:", OUTPUT_QS_PATH, "\n"))
+```
+
+```{r sessionInfo}
+sessionInfo()
+
+```

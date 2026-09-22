@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "Please cite the accompanying LOY-AML study when using this code."
+type: software
+license: MIT
+title: "LOY-AML: transcriptomic analysis code"
+authors:
+  - family-names: Wang
+    given-names: Cankun
+repository-code: "https://github.com/OSU-BMBL/LOY-AML"
+abstract: "Human bulk RNA-seq, single-cell RNA-seq, CITE-seq and figure-generation workflows for the study of Y-chromosome loss in acute myeloid leukemia."

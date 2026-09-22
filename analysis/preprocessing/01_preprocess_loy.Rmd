@@ -1,0 +1,140 @@
+---
+title: "LOY CITE-seq preprocessing"
+output:
+  html_document:
+    code_folding: show
+    theme: cosmo
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+source("config/paths.R")
+source("analysis/preprocessing/config.R")
+preprocessing <- preprocessing_paths()
+knitr::opts_knit$set(root.dir = preprocessing$root)
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 10, fig.height = 7
+)
+```
+
+Preprocess the three pooled LOY samples, normalize RNA and ADT assays, and integrate RNA profiles with Harmony.
+
+## Libraries and parameters
+
+```{r libraries}
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(ggthemes)
+library(harmony)
+library(qs)
+
+SAMPLES_TO_PROCESS <- c("Pool1", "Pool2", "Pool3")
+CELLRANGER_OUTPUT_DIR <- preprocessing$cellranger
+OUTPUT_QS_PATH <- preprocessing$loy
+PERCENT_MITO_FILTER <- 15
+NCOUNT_RNA_MIN_FILTER <- 1000
+NCOUNT_RNA_MAX_FILTER <- 30000
+NPCS_TO_CALCULATE <- 50
+NPCS_TO_USE <- 30
+theme_set(theme_clean())
+```
+
+## Load RNA and ADT counts
+
+```{r load_data}
+seurat_objects <- list()
+for (sample_name in SAMPLES_TO_PROCESS) {
+  data_path <- file.path(
+    CELLRANGER_OUTPUT_DIR, paste0(sample_name, "_multi_results"),
+    "sample_filtered_feature_bc_matrix.h5"
+  )
+  input_data <- Read10X_h5(data_path)
+  object <- CreateSeuratObject(
+    counts = input_data$`Gene Expression`, project = sample_name
+  )
+  object[["ADT"]] <- CreateAssayObject(
+    counts = input_data$`Antibody Capture`[, colnames(object), drop = FALSE]
+  )
+  object[["percent.mt"]] <- PercentageFeatureSet(object, pattern = "^MT-")
+  seurat_objects[[sample_name]] <- object
+}
+```
+
+## Quality control
+
+```{r qc_before_filtering}
+merged_seurat_unfiltered <- merge(
+  seurat_objects[[1]], y = seurat_objects[-1],
+  add.cell.ids = SAMPLES_TO_PROCESS
+)
+VlnPlot(
+  merged_seurat_unfiltered,
+  features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), pt.size = 0.1
+)
+```
+
+```{r filter_cells}
+filtered_seurat_objects <- lapply(seurat_objects, function(object) {
+  subset(
+    object,
+    subset = nCount_RNA > NCOUNT_RNA_MIN_FILTER &
+      nCount_RNA < NCOUNT_RNA_MAX_FILTER &
+      percent.mt < PERCENT_MITO_FILTER
+  )
+})
+integrated_seurat_obj <- merge(
+  filtered_seurat_objects[[1]], y = filtered_seurat_objects[-1],
+  add.cell.ids = SAMPLES_TO_PROCESS
+)
+VlnPlot(
+  integrated_seurat_obj,
+  features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), pt.size = 0.1
+)
+```
+
+## RNA integration and ADT normalization
+
+```{r integrate}
+DefaultAssay(integrated_seurat_obj) <- "RNA"
+integrated_seurat_obj <- NormalizeData(integrated_seurat_obj, verbose = FALSE)
+integrated_seurat_obj <- FindVariableFeatures(
+  integrated_seurat_obj, selection.method = "vst", nfeatures = 2000,
+  verbose = FALSE
+)
+integrated_seurat_obj <- ScaleData(integrated_seurat_obj, verbose = FALSE)
+integrated_seurat_obj <- RunPCA(
+  integrated_seurat_obj, npcs = NPCS_TO_CALCULATE, verbose = FALSE
+)
+integrated_seurat_obj <- RunHarmony(
+  object = integrated_seurat_obj, group.by.vars = "orig.ident",
+  reduction.use = "pca", verbose = FALSE
+)
+integrated_seurat_obj <- FindNeighbors(integrated_seurat_obj, reduction = "harmony")
+integrated_seurat_obj <- RunUMAP(
+  integrated_seurat_obj, reduction = "harmony", dims = 1:NPCS_TO_USE
+)
+integrated_seurat_obj <- FindClusters(integrated_seurat_obj, graph.name = "RNA_snn")
+integrated_seurat_obj <- NormalizeData(
+  integrated_seurat_obj, assay = "ADT", normalization.method = "CLR"
+)
+integrated_seurat_obj <- ScaleData(integrated_seurat_obj, assay = "ADT")
+```
+
+```{r umap}
+DimPlot(integrated_seurat_obj, group.by = "orig.ident") +
+  DimPlot(integrated_seurat_obj, label = TRUE, repel = TRUE)
+```
+
+## Save
+
+```{r save}
+DefaultAssay(integrated_seurat_obj) <- "RNA"
+qsave(integrated_seurat_obj, OUTPUT_QS_PATH)
+```
+
+```{r session}
+sessionInfo()
+```

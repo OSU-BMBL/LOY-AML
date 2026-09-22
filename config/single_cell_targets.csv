@@ -1,0 +1,13 @@
+name,target,description
+annotation,lineage_annotation,Cell lineage annotation
+celltype-de,degs_by_celltype,Differential expression by cell type
+cd8-states,cd8_states_clean,CD8 state annotation
+cd8-de,degs_by_cd8_state_clean,Differential expression by CD8 state
+trajectory-input,cd8_states,CD8 input for the trajectory renderer
+y-signature,fig_final_F3a_ysig_umap_file,Y-signature UMAP from workflow objects
+y-gene-dotplot,fig_final_F3b_ygene_dotplot_file,Y-linked gene dot plot
+patient-y-signature,fig_final_F3d_ysig_persample_violin_file,Per-patient Y-signature plot
+blast-volcano,fig_final_F1B_blast_volcano_file,Blast differential-expression plot
+cd8-volcano,fig_final_F5b_naive_volcano_file,Naive CD8 differential-expression plot
+bach2-expression,fig_final_F5E2_bach2_violin_state_file,BACH2 expression by CD8 state
+bach2-regulon,fig_final_F5E3_bach2_regulon_file,BACH2 regulon activity

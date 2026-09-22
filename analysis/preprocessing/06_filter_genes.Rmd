@@ -1,0 +1,146 @@
+---
+title: "Shared genes and Y-chromosome gene retention"
+output:
+  html_document:
+    code_folding: show
+    theme: cosmo
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+source("config/paths.R")
+source("analysis/preprocessing/config.R")
+preprocessing <- preprocessing_paths()
+knitr::opts_knit$set(root.dir = preprocessing$root)
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 10, fig.height = 7
+)
+```
+
+# 1. Set-Up
+
+Retain genes expressed in both cohorts, together with Y-chromosome genes retrieved from Ensembl.
+
+## 1.1 Libraries
+
+```{r setup_libs}
+library(Seurat)
+library(dplyr)
+library(qs)
+library(biomaRt)
+```
+
+## 1.2 Define Paths and Parameters
+
+```{r setup_variables}
+# --- Input/Output Files ---
+INPUT_QS_PATH <- preprocessing$annotated
+OUTPUT_QS_PATH <- preprocessing$shared_genes
+
+# --- Cohort Definition ---
+NEW_COHORT_IDS <- c("Pool1", "Pool2", "Pool3")
+```
+
+# 2. Load Integrated Seurat Object
+
+```{r load_data}
+if (!file.exists(INPUT_QS_PATH)) {
+  stop(paste("Input file not found:", INPUT_QS_PATH))
+}
+
+integrated_seurat_obj <- qread(INPUT_QS_PATH)
+
+cat("Successfully loaded the full integrated Seurat object.\n")
+cat("Original object dimensions:\n")
+print(integrated_seurat_obj)
+```
+
+# 3. Fetch All Y-Chromosome Genes
+
+Retrieve Y-chromosome gene symbols with `biomaRt`.
+
+```{r fetch_y_genes}
+cat("\n--- Fetching all Y-chromosome genes from Ensembl... ---\n")
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+y_genes_df <- getBM(
+  attributes = c("hgnc_symbol"),
+  filters = "chromosome_name",
+  values = "Y",
+  mart = ensembl
+)
+
+# Extract the gene symbols into a character vector, removing any blank entries
+ALL_Y_GENES_FROM_ENSEMBL <- y_genes_df$hgnc_symbol
+ALL_Y_GENES_FROM_ENSEMBL <- unique(ALL_Y_GENES_FROM_ENSEMBL[ALL_Y_GENES_FROM_ENSEMBL != ""])
+cat(paste("Found", length(ALL_Y_GENES_FROM_ENSEMBL), "unique Y-chromosome gene symbols.\n"))
+```
+
+# 4. Identify Genes to Keep
+
+Combine genes expressed in both cohorts with the Y-chromosome gene list.
+
+```{r find_genes_to_keep}
+cat("\n--- Identifying final gene set for filtering ---\n")
+
+# Get the RNA counts matrix
+rna_counts <- GetAssayData(integrated_seurat_obj, assay = "RNA", layer = "counts")
+
+# --- 4a. Identify cells in each cohort ---
+all_cell_barcodes <- colnames(integrated_seurat_obj)
+new_cohort_cells <- all_cell_barcodes[integrated_seurat_obj$orig.ident.x %in% NEW_COHORT_IDS]
+old_cohort_cells <- all_cell_barcodes[!(integrated_seurat_obj$orig.ident.x %in% NEW_COHORT_IDS)]
+
+# --- 4b. Find the intersection of expressed genes ---
+genes_in_new_cohort <- rownames(rna_counts)[rowSums(rna_counts[, new_cohort_cells, drop = FALSE]) > 0]
+genes_in_old_cohort <- rownames(rna_counts)[rowSums(rna_counts[, old_cohort_cells, drop = FALSE]) > 0]
+common_genes <- intersect(genes_in_new_cohort, genes_in_old_cohort)
+cat(paste("Found", length(common_genes), "genes common to both cohorts.\n"))
+
+# --- 4c. Combine common genes with ALL Y-chromosome genes ---
+# This ensures that even if a Y-gene was not "common", it will be kept.
+final_genes_to_keep <- unique(c(common_genes, ALL_Y_GENES_FROM_ENSEMBL))
+cat(paste("Final gene list (common genes + all Y genes) contains", length(final_genes_to_keep), "genes.\n"))
+```
+
+# 5. Create New Seurat Object with Filtered Genes
+
+```{r create_new_object}
+cat("\n--- Creating new Seurat object with the filtered gene list ---\n")
+
+# Subset the RNA assay to keep only the desired genes.
+# Keep the original object and write the filtered object separately.
+filtered_seurat_obj <- subset(integrated_seurat_obj, features = final_genes_to_keep)
+
+cat("Successfully created the new, gene-filtered Seurat object.\n")
+```
+
+# 6. Verification
+
+```{r verify_object}
+cat("\n--- Verifying object dimensions ---\n")
+cat("\nOriginal object dimensions:\n")
+print(integrated_seurat_obj)
+cat("\nNew filtered object dimensions:\n")
+print(filtered_seurat_obj)
+
+# Check if a key Y-gene like PRKY is still in the new object
+prky_check <- "PRKY" %in% rownames(filtered_seurat_obj[["RNA"]])
+cat(paste0("\nVerification check: Is 'PRKY' present in the new object? ", prky_check, "\n"))
+if(!prky_check) {
+    warning("Warning: PRKY was not found in the final object. Check gene names and biomaRt output.")
+}
+```
+
+# 7. Save Filtered Object
+
+```{r save_object}
+qs::qsave(filtered_seurat_obj, OUTPUT_QS_PATH)
+cat(paste("\nSuccessfully saved the filtered Seurat object to:", OUTPUT_QS_PATH, "\n"))
+```
+
+```{r sessionInfo}
+sessionInfo()
+
+```

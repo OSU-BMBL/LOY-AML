@@ -1,0 +1,183 @@
+---
+title: "Human AML bulk RNA-seq: prepare cohort"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+source("analysis/human_bulk/config.R")
+# Report display options
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(echo = FALSE)
+library(table1)
+library(dplyr)
+library(readxl)
+
+```
+
+# Combine cohorts
+
+```{r}
+
+counts1 <- read.table(bulk_files$cohort_counts, sep = ",", header = T)
+meta1 <- read.csv(bulk_files$cohort_metadata, stringsAsFactors = F)
+
+# Remove rows with duplicated row names
+if (length(which(duplicated.default(counts1[, 1]))) > 0) {
+  counts1 <- counts1[-which(duplicated.default(counts1[, 1]) == T),]
+}
+rownames(counts1) <- counts1[, 1]
+counts1 <- counts1[,-1]
+keep <- rowSums(counts1) >= 0
+counts1 <- counts1[keep, ]
+meta1 <- meta1 %>%
+  dplyr::filter(sample_id != "NULL")
+counts1 <- counts1[,meta1$sample_id]
+rownames(meta1) <- meta1$sample_id
+
+# Alliance
+counts2 <- read.table(bulk_files$alliance_counts, header = T)
+counts2 <- counts2[, c(-1,-3)]
+if (length(which(duplicated.default(counts2[, 1]))) > 0) {
+  counts2 <- counts2[-which(duplicated.default(counts2[, 1]) == T),]
+}
+rownames(counts2) <- counts2[, 1]
+counts2 <- counts2[,-1]
+
+meta2 <- readxl::read_xlsx(bulk_files$alliance_metadata)
+meta2 <- meta2 %>%
+  dplyr::filter(sample_id %in% colnames(counts2)) %>%
+  dplyr::select(sample_id, `Cyto.Group`, Race, Age, Sex) %>%
+  dplyr::mutate(
+    Batch = "Batch_Alliance",
+    Cyto.Group = case_when(
+      Cyto.Group == "sole -Y" ~ "LOY",
+      Cyto.Group == "CN-AML" ~ "CN_AML",
+                           T ~ Cyto.Group)
+  )
+counts2 <- counts2[,meta2$sample_id]
+
+# Montri
+counts3 <- read.table(bulk_files$montri_counts, sep = ",", header = T, row.names = 1)
+meta3 <- read.table(bulk_files$montri_metadata, sep = ",", header = T)
+colnames(counts3) <- gsub("RNAseqV2","",colnames(counts3))
+meta3 <- meta3 %>%
+  dplyr::filter(Lab_ID %in% colnames(counts3)) %>%
+  dplyr::mutate(
+    Batch = "Batch_Montri",
+    sample_id = Lab_ID,
+    Cyto.Group = case_when(
+      Cyto.Group == "sole -Y" ~ "LOY",
+      Cyto.Group == "CN-AML" ~ "CN_AML",
+                           T ~ Cyto.Group)
+  ) %>%
+  dplyr::select(sample_id, `Cyto.Group`, Race, Age, Sex, Batch)
+
+counts3 <- counts3[,meta3$sample_id]
+
+# Merge
+merged_counts <- merge(counts1, counts2, by = "row.names", all = F)
+rownames(merged_counts) <- merged_counts$Row.names
+merged_counts <- merged_counts[,-1]
+merged_counts <- merge(merged_counts, counts3, by = "row.names", all = F)
+rownames(merged_counts) <- merged_counts$Row.names
+merged_counts <- merged_counts[,-1]
+
+merged_meta <- rbind(meta1, meta2, meta3)
+
+```
+
+# Male CN and LOY
+
+```{r}
+
+merged_meta1 <- merged_meta %>%
+  dplyr::filter(Sex == "Male") %>%
+  dplyr::filter(Cyto.Group %in% c("LOY","CN_AML"))
+merged_counts1 <- merged_counts[,merged_meta1$sample_id]
+rownames(merged_meta1) <- merged_meta1$sample_id
+# Generate a summary table for the variable `meta`
+
+summary_table <- table1(~ Race+Age+Sex+Cyto.Group, data = merged_meta)
+
+# Print the summary table
+print(summary_table)
+
+summary_table <- table1(~ Race+Age+Sex+Cyto.Group, data = merged_meta1)
+
+# Print the summary table
+print(summary_table)
+
+write.csv(merged_counts1, file.path(bulk_dirs$prepared, "counts_male.csv"))
+write.csv(merged_meta1, file.path(bulk_dirs$prepared, "samples_male.csv"))
+```
+
+# Male and female CN and LOY
+
+```{r}
+
+merged_meta1 <- merged_meta %>%
+  dplyr::filter(Cyto.Group %in% c("LOY","CN_AML"))
+merged_counts1 <- merged_counts[,merged_meta1$sample_id]
+rownames(merged_meta1) <- merged_meta1$sample_id
+# Generate a summary table for the variable `meta`
+
+summary_table <- table1(~ Race+Age+Sex+Cyto.Group, data = merged_meta)
+
+# Print the summary table
+print(summary_table)
+
+summary_table <- table1(~ Race+Age+Sex+Cyto.Group, data = merged_meta1)
+
+# Print the summary table
+print(summary_table)
+
+write.csv(merged_counts1, bulk_files$counts)
+write.table(merged_counts1, file.path(bulk_dirs$prepared, "counts.tsv"), sep = "\t", quote = F)
+write.csv(merged_meta1, bulk_files$metadata)
+```
+
+# Cohort summary
+```{r}
+library(table1)
+
+# Custom summary function for Age to display median and range as whole numbers
+custom_summary <- function(x) {
+  x <- na.omit(x)
+  sprintf("Median (Range): %d (%d-%d)", round(median(x)), floor(min(x)), ceiling(max(x)))
+}
+
+# Rename `Cyto.Group` and modify `CN_AML` labels in the data
+merged_meta1 <- merged_meta1 %>%
+  mutate(
+    Cyto.Group = ifelse(Cyto.Group == "CN_AML", "CN-AML", Cyto.Group),
+    Cyto.Group = factor(Cyto.Group, levels = unique(Cyto.Group))  # Ensure proper factor levels
+  )
+
+# Update variable labels
+label(merged_meta1$Cyto.Group) <- "Cytogenetic Group"
+label(merged_meta1$Age) <- "Age (years)"
+
+rndr <- function(x, name, ...) {
+    if (!is.numeric(x)) return(render.categorical.default(x))
+    what <- switch(name,
+        Age = "Median [Min, Max]",
+        wt  = "Mean (SD)")
+    parse.abbrev.render.code(c("", what))(x)
+}
+
+# Create summary table
+summary_table <- table1(
+  ~ Race + Age + Sex + Cyto.Group,
+  data = merged_meta1,
+  render = rndr
+)
+
+print(summary_table)
+
+```

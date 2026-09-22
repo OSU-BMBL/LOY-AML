@@ -1,0 +1,75 @@
+---
+title: "Reference CITE-seq preparation"
+output:
+  html_document:
+    code_folding: show
+    theme: cosmo
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+source("config/paths.R")
+source("analysis/preprocessing/config.R")
+preprocessing <- preprocessing_paths()
+knitr::opts_knit$set(root.dir = preprocessing$root)
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 10, fig.height = 7
+)
+```
+
+Extract male AML cells from GSE185381 into per-sample Seurat objects for cohort integration. Cell names use the `sample:barcode` identifiers in the reference metadata.
+
+## Libraries and sample selection
+
+```{r libraries}
+library(Seurat)
+library(dplyr)
+library(qs)
+```
+
+```{r metadata}
+metadata <- read.csv(preprocessing$reference_metadata, stringsAsFactors = FALSE)
+required <- c("NAME", "sex", "disease__ontology_label")
+stopifnot(all(required %in% names(metadata)))
+metadata <- metadata %>%
+  filter(sex == "male", disease__ontology_label == "acute myeloid leukemia")
+sample_manifest <- read.csv(preprocessing$reference_samples, stringsAsFactors = FALSE)
+if (!"sample_id" %in% names(sample_manifest)) stop("Reference sample manifest requires sample_id.")
+selected_samples <- as.character(sample_manifest$sample_id)
+if (!length(selected_samples) || anyNA(selected_samples) ||
+    any(!nzchar(selected_samples)) || anyDuplicated(selected_samples)) {
+  stop("Reference sample_id values must be nonempty and unique.")
+}
+eligible_samples <- unique(vapply(strsplit(metadata$NAME, ":"), `[`, "", 1))
+if (!all(selected_samples %in% eligible_samples)) {
+  stop("Each reference sample must contain male AML cells in metadata.csv.")
+}
+```
+
+## Export per-sample objects
+
+```{r prepare_samples}
+for (sample_name in selected_samples) {
+  input_data <- Read10X(file.path(preprocessing$reference_counts, sample_name))
+  rna_counts <- if (is.list(input_data)) input_data$`Gene Expression` else input_data
+  object <- CreateSeuratObject(counts = rna_counts, project = sample_name)
+
+  if (is.list(input_data) && "Antibody Capture" %in% names(input_data)) {
+    object[["ADT"]] <- CreateAssayObject(
+      counts = input_data$`Antibody Capture`[, colnames(object), drop = FALSE]
+    )
+  }
+
+  object <- RenameCells(
+    object, new.names = paste0(sample_name, ":", sub("-1$", "", colnames(object)))
+  )
+  object <- subset(object, cells = intersect(colnames(object), metadata$NAME))
+  qsave(object, file.path(preprocessing$reference_objects, paste0(sample_name, ".qs")))
+}
+```
+
+```{r session}
+sessionInfo()
+```

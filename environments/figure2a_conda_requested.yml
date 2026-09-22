@@ -1,0 +1,24 @@
+name: loy-r44
+channels:
+  - defaults
+dependencies:
+  - r-ggrastr
+  - r-base=4.4
+  - r-vctrs
+  - r-digest
+  - r-bh
+  - r-base64url
+  - r-patchwork
+  - r-rcppparallel
+  - r-igraph
+  - r-seurat
+  - r-mass
+  - r-yaml
+  - r-rcpp
+  - r-ragg
+  - r-sp
+  - r-ggplot2
+  - r-data.table
+  - r-jsonlite
+  - r-callr
+  - r-tidyselect

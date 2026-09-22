@@ -1,0 +1,358 @@
+---
+title: "CITE-seq cell annotation"
+output:
+  html_document:
+    code_folding: show
+    theme: cosmo
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+source("config/paths.R")
+source("analysis/preprocessing/config.R")
+preprocessing <- preprocessing_paths()
+knitr::opts_knit$set(root.dir = preprocessing$root)
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 10, fig.height = 7
+)
+```
+
+# 1. Set-Up
+
+Inspect RNA and ADT markers, apply the cluster annotation map, and summarize cell-type composition.
+
+## 1.1 Libraries
+
+```{r setup_libs}
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(ggthemes)
+library(qs)
+
+```
+
+## 1.2 Load Data and Parameters
+
+```{r setup_variables}
+# --- Input File ---
+# Path to the integrated Seurat object saved from the previous step
+INPUT_QS_PATH <- preprocessing$sample_assigned
+
+# --- Analysis Parameters ---
+# List of antibodies (must match previous scripts)
+ANTIBODY_LIST <- c("CD123", "CD34", "CD33", "HLA-DR", "TCRab", "CD4", "CD19", "CD8", "CD3")
+
+# List of canonical gene markers to visualize
+GENE_MARKER_LIST <- c(
+  # Progenitor / AML Blast markers
+  "CD34", "SOX4", "GATA2",
+  # Myeloid markers
+  "MPO", "ELANE", "LYZ", "CD33", "CEBPE",
+  # T-Cell markers
+  "CD3E", "CD4", "CD8A",
+  # B-Cell markers
+  "MS4A1", "CD19", "JCHAIN",
+  # NK Cell markers
+  "NKG7", "GNLY"
+)
+
+# Set a consistent theme for plots
+theme_set(theme_clean())
+
+```
+
+```{r load_data}
+if (!file.exists(INPUT_QS_PATH)) {
+  stop(paste("Input file not found:", INPUT_QS_PATH))
+}
+
+# Load the final integrated Seurat object
+integrated_seurat_obj <- qread(INPUT_QS_PATH)
+
+cat("Successfully loaded the integrated Seurat object.\n")
+print(integrated_seurat_obj)
+```
+
+# 2. UMAP Visualizations
+
+## 2.1 UMAP by Sample and Cluster
+
+Visualize the integrated embedding by sample and cluster.
+
+```{r umap_by_sample_cluster, fig.width=14, fig.height=6}
+# Set default assay to RNA for plotting gene expression later
+DefaultAssay(integrated_seurat_obj) <- "RNA"
+
+p_by_sample <- DimPlot(integrated_seurat_obj, reduction = "umap", group.by = "orig.ident", pt.size = 0.2) +
+               labs(title = "Integrated UMAP by Sample Pool")
+
+p_by_cluster <- DimPlot(integrated_seurat_obj, reduction = "umap", label = TRUE, repel = TRUE, pt.size = 0.2) +
+                labs(title = "Integrated UMAP by Cluster") + NoLegend()
+
+p_by_sample + p_by_cluster
+```
+
+# 3. Marker Visualization
+
+Inspect protein and RNA markers across the integrated embedding.
+
+## 3.1 Antibody (ADT) Feature Plots
+
+Inspect ADT expression across cell populations.
+
+```{r adt_feature_plots, fig.width=12, fig.height=10}
+# Set default assay to ADT for plotting protein expression
+DefaultAssay(integrated_seurat_obj) <- "ADT"
+
+# Use ADT feature names stored in the object.
+adt_features_in_obj <- rownames(integrated_seurat_obj[["ADT"]])
+
+FeaturePlot(
+  integrated_seurat_obj,
+  features = adt_features_in_obj,
+  reduction = "umap",
+  min.cutoff = "q05",
+  max.cutoff = "q95",
+  pt.size = 0.1,
+  cols = c("lightgrey", "darkred"),
+  ncol = 3
+)
+```
+
+## 3.2 Canonical Gene Marker Feature Plots
+
+Inspect canonical RNA markers for cell-type annotation.
+
+```{r rna_feature_plots, fig.width=12, fig.height=15}
+DefaultAssay(integrated_seurat_obj) <- "RNA"
+
+# Filter for genes that are actually in the object to avoid errors
+gene_markers_in_obj <- intersect(GENE_MARKER_LIST, rownames(integrated_seurat_obj))
+
+FeaturePlot(
+  integrated_seurat_obj,
+  features = gene_markers_in_obj,
+  reduction = "umap",
+  min.cutoff = "q05",
+  max.cutoff = "q95",
+  pt.size = 0.1,
+  cols = c("lightgrey", "darkblue"),
+  ncol = 3
+)
+```
+
+# 4. Cluster Marker Identification
+
+Identify positive RNA markers for each cluster.
+
+## 4.1 Find All Cluster Markers (RNA)
+
+```{r find_markers}
+# Set Idents to the final clusters
+Idents(integrated_seurat_obj) <- "seurat_clusters"
+DefaultAssay(integrated_seurat_obj) <- "RNA"
+integrated_seurat_obj <- JoinLayers(integrated_seurat_obj)
+# Find markers for every cluster compared to all remaining cells, report only the positive ones
+cluster_markers <- FindAllMarkers(integrated_seurat_obj, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, verbose = FALSE)
+
+# Get the top 10 markers for display
+top10_markers <- cluster_markers %>%
+  group_by(cluster) %>%
+  top_n(n = 10, wt = avg_log2FC)
+```
+
+## 4.2 Visualize Top Markers with a Dot Plot
+
+Display the top cluster markers.
+
+```{r dotplot_markers, fig.height=8, fig.width=12}
+DotPlot(integrated_seurat_obj, features = unique(top10_markers$gene)) +
+  labs(title = "Top 10 Marker Genes per Cluster") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+```
+
+# 5. Cell-type annotation
+
+```{r annotate_clusters}
+# Use clustering labels as the starting identities
+Idents(integrated_seurat_obj) <- integrated_seurat_obj$seurat_clusters
+
+# Build a full mapping: default = "Leukemia", with explicit overrides
+clust_levels <- levels(integrated_seurat_obj$seurat_clusters)
+map_simple <- setNames(rep("Leukemia", length(clust_levels)), clust_levels)
+
+# Cluster-specific cell-type assignments
+map_simple[c("3")]                  <- "CD4 T"
+map_simple[c("10")]                 <- "CD8 T"
+map_simple[c("13")]                 <- "B cell"
+map_simple[c("6","9","12","19","20","21","23")] <- "Unidentified"
+
+# Apply mapping
+integrated_seurat_obj <- RenameIdents(integrated_seurat_obj, map_simple)
+
+# Save to metadata (consistent naming)
+integrated_seurat_obj <- AddMetaData(
+  integrated_seurat_obj,
+  metadata = Idents(integrated_seurat_obj),
+  col.name = "cell_type"
+)
+
+```
+
+# 6. Cluster Proportions by Sample
+
+Summarize cell-type composition by sample.
+
+```{r cluster_proportions, fig.width=12, fig.height=6}
+# Calculate proportions
+cluster_props <- integrated_seurat_obj@meta.data %>%
+  group_by(cell_type, orig.ident) %>%
+  summarise(n = n(), .groups = 'drop') %>%
+  group_by(orig.ident) %>%
+  mutate(prop = n / sum(n))
+
+# Plot
+ggplot(cluster_props, aes(x = cell_type, y = prop, fill = orig.ident)) +
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Proportion of Cells",
+    x = "Cluster",
+    y = "Proportion",
+    fill = "Sample"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+```{r sessionInfo}
+sessionInfo()
+```
+
+```{r}
+# cat1 = cell type (rows), cat2 = sample/group (columns)
+pct_table <- function(cat1, cat2, within = c("sample", "celltype"), digits = 1) {
+  within <- match.arg(within)
+  tab <- table(cat1, cat2, dnn = c("cell_type", "group"))
+  margin <- if (within == "sample") 2 else 1   # 2 = column-wise (per sample); 1 = row-wise (per cell type)
+  round(prop.table(tab, margin = margin) * 100, digits)
+}
+
+# counts
+count_table <- function(cat1, cat2) {
+  table(cat1, cat2, dnn = c("cell_type", "group"))
+}
+
+
+# Plot
+DimPlot(integrated_seurat_obj, reduction = "umap", label = TRUE, pt.size = 0.7)
+
+# ---------------------------
+# Counts and percentages by sample
+# ---------------------------
+print_total_pct <- function(celltype, by, digits = 1){
+  tb  <- table(celltype, by)
+  pct <- prop.table(tb, margin = 2) * 100
+  cbind(Count = tb, Percent = round(pct, digits))
+}
+
+by_field <- if ("sample" %in% colnames(integrated_seurat_obj@meta.data)) {
+  integrated_seurat_obj$sample
+} else {
+  integrated_seurat_obj$orig.ident
+}
+
+knitr::kable(table(integrated_seurat_obj$cell_type, by_field),
+             caption = "Cell-type counts by sample")
+
+knitr::kable(print_total_pct(integrated_seurat_obj$cell_type, by_field),
+             caption = "Cell-type percentages by sample")
+
+tab_counts <- count_table(integrated_seurat_obj$cell_type, by_field)
+tab_pct    <- pct_table(integrated_seurat_obj$cell_type, by_field, within = "sample", digits = 1)
+
+knitr::kable(tab_counts, caption = "Counts: cells per cell type by sample")
+knitr::kable(tab_pct,    caption = "Percent of each sample that is each cell type")
+
+```
+
+```{r}
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(forcats)
+library(scales)
+library(knitr)
+
+# Work off metadata
+meta <- integrated_seurat_obj@meta.data
+
+# Counts per cell type x sample
+cluster_counts <- meta %>%
+  count(cell_type, orig.ident, name = "n")
+
+# Totals per cell type (for ordering)
+totals_ct <- cluster_counts %>%
+  group_by(cell_type) %>%
+  summarise(total = sum(n), .groups = "drop")
+
+# Sample fractions within each cell type
+cluster_props_ct <- cluster_counts %>%
+  group_by(cell_type) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup() %>%
+  left_join(totals_ct, by = "cell_type") %>%
+  mutate(cell_type = fct_reorder(cell_type, total, .desc = TRUE))
+
+# --- Plot 1: Percent of each cell type that comes from each sample ---
+p_pct <- ggplot(cluster_props_ct, aes(x = cell_type, y = prop, fill = orig.ident)) +
+  geom_col() +  # already normalized within cell type
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title = "Sample composition",
+    x = "Cell type",
+    y = "Percent of cell type",
+    fill = "Sample"
+  ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# --- Plot 2: Absolute counts per cell type stacked by sample ---
+p_abs <- ggplot(cluster_props_ct, aes(x = cell_type, y = n, fill = orig.ident)) +
+  geom_col(position = "stack") +
+  labs(
+    title = "Cell counts by type and sample",
+    x = "Cell type",
+    y = "Cell count",
+    fill = "Sample"
+  ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Print the plots
+print(p_pct)
+print(p_abs)
+
+# --- Tables (optional) ---
+# Wide counts
+count_table_wide <- cluster_counts %>%
+  pivot_wider(names_from = orig.ident, values_from = n, values_fill = 0) %>%
+  arrange(desc(rowSums(across(where(is.numeric)))))
+
+# Wide percentages (within cell type)
+pct_table_wide <- cluster_props_ct %>%
+  mutate(Percent = round(prop * 100, 1)) %>%
+  select(cell_type, orig.ident, Percent) %>%
+  pivot_wider(names_from = orig.ident, values_from = Percent, values_fill = 0) %>%
+  arrange(match(cell_type, levels(cluster_props_ct$cell_type)))
+
+kable(count_table_wide, caption = "Counts per cell type by sample")
+kable(pct_table_wide,   caption = "Percent within each cell type (by sample)")
+
+qs::qsave(integrated_seurat_obj, preprocessing$annotated)
+```

@@ -1,0 +1,27 @@
+command,type,workflow,script,description
+bulk-prepare,rmd,bulk,analysis/human_bulk/01_preprocessing/prepare_cohort.Rmd,Prepare integrated counts and sample metadata
+bulk-de,rmd,bulk,analysis/human_bulk/02_analysis/differential_expression.Rmd,Differential expression and GO/Reactome enrichment
+bulk-hallmark,rmd,bulk,analysis/human_bulk/02_analysis/hallmark_enrichment.Rmd,Hallmark enrichment
+bulk-zfy,script,bulk,analysis/human_bulk/02_analysis/zfy_overlap.R,ZFY overlap analysis
+plot-volcano,script,bulk,analysis/human_bulk/03_figures/volcano.R,Bulk volcano plots
+plot-hallmark-bars,script,bulk,analysis/human_bulk/03_figures/hallmark_barplot.R,Hallmark bar plots
+plot-hallmark-dots,script,bulk,analysis/human_bulk/03_figures/hallmark_dotplot.R,Hallmark dot plots
+plot-go,script,bulk,analysis/human_bulk/03_figures/go_enrichment.R,GO pathway plots
+plot-deg-overlap,script,bulk,analysis/human_bulk/03_figures/deg_overlap.R,Differential-gene overlap plots
+plot-cell-fractions,script,bulk,analysis/human_bulk/03_figures/cell_fractions.R,Cell-fraction comparisons
+plot-deconvolution,script,bulk,analysis/human_bulk/03_figures/deconvolution_correlations.R,Deconvolution correlations
+plot-y-genes,script,bulk,analysis/human_bulk/03_figures/y_gene_expression.R,Y-linked expression plots
+plot-y-signature,script,bulk,analysis/human_bulk/03_figures/y_signature_heatmap.R,Y-signature compartment heatmap
+plot-zfy,script,bulk,analysis/human_bulk/03_figures/zfy_pathways.R,ZFY pathway plots
+export-vst,script,bulk,analysis/human_bulk/04_exports/batch_corrected_expression.R,Export batch-corrected expression
+export-hsc,script,bulk,analysis/human_bulk/04_exports/hsc_weighted_expression.R,Export HSC-weighted expression
+preprocess-loy,rmd,single_cell,analysis/preprocessing/01_preprocess_loy.Rmd,Preprocess LOY CITE-seq matrices
+preprocess-reference,rmd,single_cell,analysis/preprocessing/02_preprocess_reference.Rmd,Prepare reference sample objects
+integrate-cohorts,script,single_cell,analysis/preprocessing/03_integrate_cohorts.R,Integrate cohorts and cell metadata
+assign-samples,rmd,single_cell,analysis/preprocessing/04_assign_samples.Rmd,Assign sample identifiers
+annotate-cells,rmd,single_cell,analysis/preprocessing/05_annotate_cells.Rmd,Annotate integrated cells
+filter-genes,rmd,single_cell,analysis/preprocessing/06_filter_genes.Rmd,Filter genes with Y-gene rescue
+build-cohort,script,single_cell,analysis/preprocessing/07_build_cohort.R,Construct the analysis cohort
+single-cell,targets,single_cell,analysis/human_citeseq/_targets.R,Run selected single-cell targets
+y-signature-umap,script,single_cell,analysis/human_citeseq/scripts/render_y_signature_umap.R,Render the Y-signature UMAP
+cd8-trajectory,script,single_cell,analysis/human_citeseq/scripts/render_cd8_trajectory.R,Render the CD8 trajectory
